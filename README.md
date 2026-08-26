@@ -7,6 +7,12 @@ A small GTK4/VTE terminal for claude code that does four things and nothing else
 - **Notifications** when Claude Code wants your input, or a long command finishes in a background tab
 - **Persistent project paths** — tabs come back in the directories you left them
 
+![SMT with three tabs open: "api", "web" and "dotfiles". The api tab wears a
+yellow dot because Claude Code is waiting on it.](docs/screenshot.png)
+
+*The yellow dot on `api` is Claude Code asking for something while you work in
+`web`.*
+
 Measured on Ubuntu 24.04 / GNOME 46: **49.9 MB total (PSS) with 8 tabs open**,
 including the eight bash processes. For scale, VS Code's main process alone
 measures 115 MB on the same machine.
