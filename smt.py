@@ -604,11 +604,18 @@ def layout_of(node):
 
 def focus_soon(term):
     """Focus a pane once GTK has laid it out. A widget added this frame has no
-    allocation yet, and an unallocated widget cannot take the keyboard."""
+    allocation yet, and an unallocated widget cannot take the keyboard. One
+    frame is enough for a pane added to a window already on screen, but a tab
+    restored at startup is asked before the window has been presented, so keep
+    asking for a few frames rather than giving up on the first refusal."""
+    frames = [0]
+
     def go():
         term.grab_focus()
-        return False
-    GLib.idle_add(go)
+        frames[0] += 1
+        return not term.has_focus() and frames[0] < 20
+
+    GLib.timeout_add(30, go)
 
 
 # Command-key equivalents, added alongside the Ctrl bindings on macOS. GDK maps
@@ -645,6 +652,7 @@ class Window(Adw.ApplicationWindow):
         self.tabview = Adw.TabView()
         self.tabview.connect("close-page", self._on_close_page)
         self.tabview.connect("notify::selected-page", self._on_page_switched)
+        self.tabview.connect("page-reordered", self._on_page_reordered)
         self.tabview.connect("setup-menu", self._on_setup_menu)
         self._menu_page = None
         self._close_confirmed = False   # set once the user okays closing the window
@@ -950,6 +958,7 @@ class Window(Adw.ApplicationWindow):
         if select:
             self.tabview.set_selected_page(page)
             terms[0].grab_focus()
+        self.app.schedule_session_save()
         return terms[0]
 
     def _build_pane(self, node):
@@ -979,9 +988,20 @@ class Window(Adw.ApplicationWindow):
         return out
 
     def session_layout(self):
-        layouts = (layout_of(self.tabview.get_nth_page(i))
-                   for i in range(self.tabview.get_n_pages()))
-        return [{"layout": layout} for layout in layouts if layout]
+        """The shape of the window: every tab's pane tree, and which of them
+        you were looking at. A tab whose layout cannot be read is dropped, so
+        the index counts what actually gets written rather than what is open."""
+        selected = self.tabview.get_selected_page()
+        tabs, index = [], 0
+        for i in range(self.tabview.get_n_pages()):
+            page = self.tabview.get_nth_page(i)
+            layout = layout_of(page)
+            if layout is None:
+                continue
+            if page is selected:
+                index = len(tabs)
+            tabs.append({"layout": layout})
+        return tabs, index
 
     def current_terminal(self):
         page = self.tabview.get_selected_page()
@@ -1070,6 +1090,10 @@ class Window(Adw.ApplicationWindow):
             term.set_attention(False)
             term.grab_focus()
             term.refresh_title()
+        self.app.schedule_session_save()
+
+    def _on_page_reordered(self, *_):
+        self.app.schedule_session_save()
 
     def _on_setup_menu(self, _tv, page):
         self._menu_page = page
@@ -1428,9 +1452,10 @@ class App(Adw.Application):
 
     # ---- session ---------------------------------------------------------
     def _restore_session(self):
-        tabs = []
+        saved = {}
         if self.config["restore_session"]:
-            tabs = load_json(SESSION_PATH, {}).get("tabs", [])
+            saved = load_json(SESSION_PATH, {})
+        tabs = saved.get("tabs", [])
         for tab in tabs:
             # An unmounted volume or a deleted project must not silently cost
             # you the tab — and dropping it here would also erase it from the
@@ -1442,11 +1467,20 @@ class App(Adw.Application):
             layout = tab.get("layout") or {"cwd": tab.get("cwd"),
                                            "title": tab.get("title")}
             self.window.add_tab(layout=layout, select=False)
-        if self.window.tabview.get_n_pages() == 0:
+        tabview = self.window.tabview
+        if tabview.get_n_pages() == 0:
             self.window.add_tab()
-        else:
-            first = self.window.tabview.get_nth_page(0)
-            self.window.tabview.set_selected_page(first)
+            return
+        # A session from before this was recorded, or one hand-edited into
+        # nonsense, comes back on the first tab rather than not at all.
+        index = saved.get("selected", 0)
+        if not isinstance(index, int) or not 0 <= index < tabview.get_n_pages():
+            index = 0
+        page = tabview.get_nth_page(index)
+        tabview.set_selected_page(page)
+        term = getattr(page, "smt_terminal", None)
+        if term:
+            focus_soon(term)
 
     def schedule_session_save(self):
         # cwd changes on every prompt; debounce so we aren't writing constantly.
@@ -1462,7 +1496,7 @@ class App(Adw.Application):
     def save_session(self):
         if not self.window:
             return
-        tabs = self.window.session_layout()
+        tabs, selected = self.window.session_layout()
         if not tabs:
             # Having no tabs at all means the window is coming apart — a
             # logout, a SIGHUP, the shells killed out from under it — not you
@@ -1470,7 +1504,7 @@ class App(Adw.Application):
             # session those tabs came from, so leave the last good one alone.
             debug("not saving an empty session")
             return
-        save_json(SESSION_PATH, {"tabs": tabs})
+        save_json(SESSION_PATH, {"tabs": tabs, "selected": selected})
 
     # ---- notifications ---------------------------------------------------
     def _start_socket(self):

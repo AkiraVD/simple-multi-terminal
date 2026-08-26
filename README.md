@@ -238,8 +238,11 @@ in the current pane's directory.
 
 What is saved is the shape of each tab, not just a path: the splits come back
 in the same directions with their dividers where you left them, including on
-tabs you have not switched to yet. Sessions written before splits existed still
-load — one directory per tab is a tree of one pane.
+tabs you have not switched to yet. The tab you were on comes back selected and
+holding the keyboard, and the order you dragged your tabs into is kept.
+Sessions written before splits or the remembered selection existed still load —
+one directory per tab is a tree of one pane, and no recorded selection means
+the first tab.
 
 A tab whose directory is gone — an unmounted volume, a deleted project — comes
 back at your home directory, keeping its name. Dropping it instead would erase
