@@ -18,6 +18,10 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 import json  # noqa: E402
+import shutil  # noqa: E402
+import signal  # noqa: E402
+import socket  # noqa: E402
+import subprocess  # noqa: E402
 import sys  # noqa: E402
 import uuid  # noqa: E402
 from urllib.parse import unquote, urlparse  # noqa: E402
@@ -28,6 +32,9 @@ CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "simple-multi-terminal")
 DATA_DIR = os.path.join(GLib.get_user_data_dir(), "simple-multi-terminal")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 SESSION_PATH = os.path.join(DATA_DIR, "session.json")
+# One fixed path rather than one per pid: a second launch has to be able to
+# find the first one without knowing its pid.
+SOCKET_PATH = os.path.join(GLib.get_user_runtime_dir(), "smt.sock")
 
 DEFAULT_CONFIG = {
     "font": "Monospace 11",
@@ -66,12 +73,95 @@ PALETTE = [
 FG, BG = "#d8d8d8", "#1b1d1e"
 
 
-def _comm(pid):
+# ---- platform ------------------------------------------------------------
+# Three questions need the process table: what is this pid, what else is alive
+# in this tab, and is that pid still around. Linux answers them by reading
+# /proc. macOS has no /proc, so the same answers come from ps(1) and kill(2).
+IS_LINUX = sys.platform.startswith("linux")
+IS_MAC = sys.platform == "darwin"
+
+
+def _capture(argv):
+    """Stdout of a short-lived command, or "" if it failed. Never raises."""
     try:
-        with open(f"/proc/{pid}/comm") as fh:
-            return fh.read().strip() or "a command"
-    except OSError:
-        return "a command"
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=2)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return done.stdout if done.returncode == 0 else ""
+
+
+def _spawn_detached(argv):
+    """Fire and forget. Notifiers must never block or outlive their usefulness."""
+    try:
+        subprocess.Popen(argv, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    except OSError as exc:
+        debug("could not run", argv[0], exc)
+
+
+TERMINAL_NOTIFIER = shutil.which("terminal-notifier") if IS_MAC else None
+
+
+def _applescript_string(text):
+    """An AppleScript string literal; only backslash and quote need escaping."""
+    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _comm(pid):
+    """The command name behind a pid, for "npm run build is still running"."""
+    if IS_LINUX:
+        try:
+            with open(f"/proc/{pid}/comm") as fh:
+                return fh.read().strip() or "a command"
+        except OSError:
+            return "a command"
+    name = _capture(["ps", "-o", "comm=", "-p", str(pid)]).strip()
+    return os.path.basename(name) if name else "a command"
+
+
+def _linux_session_processes(leader):
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) == leader:
+            continue
+        try:
+            with open(f"/proc/{name}/stat") as fh:
+                line = fh.read()
+            # comm sits in parens and may itself contain spaces or parens,
+            # so split around the last ')' rather than on whitespace.
+            head = line.rindex(")")
+            comm = line[line.index("(") + 1:head]
+            fields = line[head + 2:].split()
+            state, session = fields[0], int(fields[3])
+        except (OSError, ValueError, IndexError):
+            continue
+        if session == leader:
+            found.append((int(name), comm, state))
+    return found
+
+
+def _bsd_session_processes(leader):
+    """The macOS equivalent, grouped by controlling terminal rather than by
+    session id: BSD ps cannot report a session id (its `sess` keyword prints a
+    kernel pointer), but VTE hands every tab its own pty, so "attached to this
+    tab's tty" picks out exactly the same processes."""
+    tty = _capture(["ps", "-o", "tty=", "-p", str(leader)]).strip()
+    if not tty or "?" in tty:
+        return []
+    found = []
+    for line in _capture(["ps", "-t", tty, "-o", "pid=,stat=,comm="]).splitlines():
+        fields = line.split(None, 2)
+        if len(fields) < 3:
+            continue
+        try:
+            pid = int(fields[0])
+        except ValueError:
+            continue
+        if pid == leader:
+            continue
+        # BSD state is a letter plus flags ("S+", "Ss", "T"); we want the letter.
+        found.append((pid, os.path.basename(fields[2]), fields[1][:1]))
+    return found
 
 
 def monospace_only(item):
@@ -95,6 +185,19 @@ def dot_icon(color):
         'viewBox="0 0 16 16"><circle cx="8" cy="8" r="4.5" fill="%s"/></svg>' % color
     ).encode()
     return Gio.BytesIcon.new(GLib.Bytes.new(svg))
+
+
+def option_path(value):
+    """A --working-directory value as a plain str.
+
+    GOptionArg.FILENAME arrives as a NUL-terminated byte array, which
+    GLib.Variant.unpack() hands back as a list of ints, not as a string.
+    """
+    if isinstance(value, list):
+        value = bytes(value)
+    if isinstance(value, bytes):
+        value = os.fsdecode(value)
+    return value.rstrip("\x00") if value else value
 
 
 def load_json(path, fallback):
@@ -134,6 +237,25 @@ def hexcolor(c):
     return "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255))
 
 
+# The Mac line-editing keys, mapped to the sequences readline and zle already
+# bind. VTE does not translate these itself — Terminal.app and iTerm2 do, which
+# is why Cmd+Delete erases a single character in a stock GTK/VTE terminal and
+# Option+Left does nothing. GTK's macOS backend reports Command as META and
+# Option as ALT.
+MAC_CMD_KEYS = {
+    Gdk.KEY_BackSpace: b"\x15",      # kill to start of line
+    Gdk.KEY_Delete:    b"\x0b",      # kill to end of line
+    Gdk.KEY_Left:      b"\x01",      # start of line
+    Gdk.KEY_Right:     b"\x05",      # end of line
+}
+MAC_ALT_KEYS = {
+    Gdk.KEY_BackSpace: b"\x1b\x7f",  # kill the word behind the cursor
+    Gdk.KEY_Delete:    b"\x1bd",     # kill the word ahead of it
+    Gdk.KEY_Left:      b"\x1bb",      # back one word
+    Gdk.KEY_Right:     b"\x1bf",      # forward one word
+}
+
+
 class Terminal(Vte.Terminal):
     """One tab's terminal. Owns its shell, its id, and its cwd tracking."""
 
@@ -142,6 +264,7 @@ class Terminal(Vte.Terminal):
         self.app = app
         self.tab_id = uuid.uuid4().hex[:12]
         self.page = None
+        self.leaf = None           # the scroller this pane sits in, if split
         self.custom_title = None   # set once the user renames; locks out OSC titles
         self.osc_title = None
         self.cwd = cwd or os.path.expanduser("~")
@@ -161,6 +284,20 @@ class Terminal(Vte.Terminal):
         self.connect("current-directory-uri-changed", self._on_cwd_changed)
         self.connect("setup-context-menu", self._on_context_menu)
 
+        # Which pane has the keyboard decides which one its tab speaks for.
+        focus = Gtk.EventControllerFocus()
+        focus.connect("enter", self._on_focus_enter)
+        self.add_controller(focus)
+
+        if IS_MAC:
+            # Capture phase: VTE claims most key presses in its own handler, so
+            # a bubbling controller would never see them. Only the eight keys
+            # in the tables above are taken; everything else falls through
+            # untouched, Option+letter included, which still composes.
+            keys = Gtk.EventControllerKey()
+            keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+            keys.connect("key-pressed", self._on_mac_editing_key)
+            self.add_controller(keys)
         self._spawn()
 
     # ---- settings --------------------------------------------------------
@@ -196,6 +333,20 @@ class Terminal(Vte.Terminal):
         })
         return [f"{k}={v}" for k, v in env.items()]
 
+    def _on_mac_editing_key(self, _controller, keyval, _keycode, state):
+        cmd = bool(state & Gdk.ModifierType.META_MASK)
+        alt = bool(state & Gdk.ModifierType.ALT_MASK)
+        # Exactly one of Cmd/Option, and nothing else held: Ctrl+key belongs to
+        # the shell, and Shift+key to whatever selection the user is making.
+        if cmd == alt or state & (Gdk.ModifierType.CONTROL_MASK
+                                  | Gdk.ModifierType.SHIFT_MASK):
+            return False
+        sequence = (MAC_CMD_KEYS if cmd else MAC_ALT_KEYS).get(keyval)
+        if sequence is None:
+            return False
+        self.feed_child(sequence)
+        return True
+
     def _spawn(self):
         shell = self.app.config["shell"] or os.environ.get("SHELL") or "/bin/bash"
         cwd = self.cwd if os.path.isdir(self.cwd) else os.path.expanduser("~")
@@ -223,24 +374,11 @@ class Terminal(Vte.Terminal):
         in this tab" — and it is the same grouping the kernel would SIGHUP if
         the tab went away.
         """
-        found = []
-        for name in os.listdir("/proc"):
-            if not name.isdigit() or int(name) == self.child_pid:
-                continue
-            try:
-                with open(f"/proc/{name}/stat") as fh:
-                    line = fh.read()
-                # comm sits in parens and may itself contain spaces or parens,
-                # so split around the last ')' rather than on whitespace.
-                head = line.rindex(")")
-                comm = line[line.index("(") + 1:head]
-                fields = line[head + 2:].split()
-                state, session = fields[0], int(fields[3])
-            except (OSError, ValueError, IndexError):
-                continue
-            if session == self.child_pid:
-                found.append((int(name), comm, state))
-        return found
+        if self.child_pid is None:
+            return []
+        if IS_LINUX:
+            return _linux_session_processes(self.child_pid)
+        return _bsd_session_processes(self.child_pid)
 
     def busy(self):
         """What is running in this tab, as (kind, command), or None if idle.
@@ -284,12 +422,22 @@ class Terminal(Vte.Terminal):
         return os.path.basename(self.cwd.rstrip("/")) or "/"
 
     def refresh_title(self):
-        if self.page:
+        # In a split tab only the focused pane names the tab; the others would
+        # otherwise take turns overwriting it every time their prompt changed.
+        if self.page and getattr(self.page, "smt_terminal", None) is self:
             self.page.set_title(self.display_title())
             self.page.set_tooltip(self.cwd)
         window = self.app.window
         if window and window.current_terminal() is self:
             window.set_title(f"{self.display_title()} — {APP_NAME}")
+
+    def _on_focus_enter(self, _controller):
+        """Take over as the pane this tab speaks for: its title becomes the
+        tab's, and its pending notification has now been read."""
+        if self.page and getattr(self.page, "smt_terminal", None) is not self:
+            self.page.smt_terminal = self
+            self.refresh_title()
+        self.set_attention(False)
 
     def _on_osc_title(self, _t):
         title = (self.get_window_title() or "").strip()
@@ -308,6 +456,10 @@ class Terminal(Vte.Terminal):
         menu = Gio.Menu()
         menu.append("Copy", "win.copy")
         menu.append("Paste", "win.paste")
+        splits = Gio.Menu()
+        splits.append("Split Right", "win.split-right")
+        splits.append("Split Down", "win.split-down")
+        menu.append_section(None, splits)
         section = Gio.Menu()
         section.append("Rename Tab…", "win.rename-tab")
         section.append("New Tab", "win.new-tab")
@@ -334,11 +486,154 @@ class Terminal(Vte.Terminal):
         if pending and not on:
             # Drop the desktop notification still sitting in the shell's tray;
             # you have looked at the tab, so it has done its job.
-            self.app.withdraw_notification(f"smt-{self.tab_id}")
+            self.app.desktop_withdraw(f"smt-{self.tab_id}")
 
     def _on_bell(self, _t):
         if self.app.config["notify_on_bell"]:
             self.app.notify_tab(self, "Bell", self.display_title())
+
+
+# ---- pane tree -----------------------------------------------------------
+# A tab holds a tree, not a terminal: Gtk.Paned for every split, and at the
+# leaves a Gtk.ScrolledWindow around one terminal. The scroller carries an
+# `smt_terminal` attribute, which is what makes a leaf recognisable while
+# walking the tree without having to guess at widget types. The root of each
+# tab is an Adw.Bin, because an AdwTabPage's child cannot be swapped after the
+# page is created and splitting has to swap it.
+
+def wrap_terminal(term):
+    """Put a terminal in the widget the pane tree actually moves around."""
+    scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    scroller.set_child(term)
+    scroller.smt_terminal = term
+    term.leaf = scroller
+    return scroller
+
+
+def pane_terminals(node):
+    """Every terminal under a widget, or under a tab page, left to right."""
+    if isinstance(node, Adw.TabPage):
+        node = node.get_child()
+    term = getattr(node, "smt_terminal", None)
+    if term is not None:
+        return [term]
+    if isinstance(node, Gtk.Paned):
+        return (pane_terminals(node.get_start_child())
+                + pane_terminals(node.get_end_child()))
+    if isinstance(node, Adw.Bin):
+        return pane_terminals(node.get_child())
+    return []
+
+
+def replace_pane(parent, old, new):
+    """Swap one child of a pane-tree node, whichever slot it occupies."""
+    if isinstance(parent, Gtk.Paned):
+        if parent.get_start_child() is old:
+            parent.set_start_child(new)
+        else:
+            parent.set_end_child(new)
+    else:
+        parent.set_child(new)      # an Adw.Bin: the root of one tab
+
+
+def place_divider(paned, ratio):
+    """Put a divider at a fraction of the split it belongs to.
+
+    The position is measured in pixels, so setting it before the split has
+    been allocated measures against a width of zero and lands every divider
+    on the left edge — a split that opens fully collapsed. A restored tab
+    that is not the one you are looking at is never allocated at all until
+    you switch to it, which can be minutes, so wait on the tab appearing
+    rather than on a timeout that would expire long before.
+    """
+    def place():
+        horizontal = paned.get_orientation() == Gtk.Orientation.HORIZONTAL
+        span = paned.get_width() if horizontal else paned.get_height()
+        if span <= 1:
+            return False
+        paned.set_position(int(span * ratio))
+        return True
+
+    if place():
+        return
+
+    handler = [0]
+
+    def on_map(widget):
+        frames = [0]
+
+        def settle():
+            # Mapped is not yet measured; the size lands a frame later.
+            frames[0] += 1
+            if place() or frames[0] > 20:
+                if handler[0]:
+                    widget.disconnect(handler[0])
+                    handler[0] = 0
+                return False
+            return True
+
+        GLib.timeout_add(30, settle)
+
+    handler[0] = paned.connect("map", on_map)
+
+
+def layout_of(node):
+    """The saved shape of a pane tree: leaves keep their directory and their
+    name, splits keep their direction and where you left the divider."""
+    if isinstance(node, Adw.TabPage):
+        node = node.get_child()
+    if isinstance(node, Adw.Bin):
+        node = node.get_child()
+    term = getattr(node, "smt_terminal", None)
+    if term is not None:
+        return {"cwd": term.cwd, "title": term.custom_title}
+    if isinstance(node, Gtk.Paned):
+        horizontal = node.get_orientation() == Gtk.Orientation.HORIZONTAL
+        span = node.get_width() if horizontal else node.get_height()
+        children = [layout_of(node.get_start_child()),
+                    layout_of(node.get_end_child())]
+        if not all(children):
+            return None
+        return {
+            "split": "h" if horizontal else "v",
+            "ratio": round(node.get_position() / span, 3) if span > 1 else 0.5,
+            "children": children,
+        }
+    return None
+
+
+def focus_soon(term):
+    """Focus a pane once GTK has laid it out. A widget added this frame has no
+    allocation yet, and an unallocated widget cannot take the keyboard."""
+    def go():
+        term.grab_focus()
+        return False
+    GLib.idle_add(go)
+
+
+# Command-key equivalents, added alongside the Ctrl bindings on macOS. GDK maps
+# the Mac Command key to <Meta>, and unlike Ctrl it collides with nothing the
+# shell wants: Ctrl+C in a tab has to stay Ctrl+C.
+MAC_ACCELS = {
+    "new-tab":     ["<Meta>t"],
+    "close-tab":   ["<Meta>w"],
+    "rename-tab":  ["<Meta><Shift>r"],
+    "preferences": ["<Meta>comma"],
+    "copy":        ["<Meta>c"],
+    "paste":       ["<Meta>v"],
+    "next-tab":    ["<Meta><Shift>bracketright"],
+    "prev-tab":    ["<Meta><Shift>bracketleft"],
+    "zoom-in":     ["<Meta>plus", "<Meta>equal"],
+    "zoom-out":    ["<Meta>minus"],
+    "zoom-reset":  ["<Meta>0"],
+    "split-right": ["<Meta>d"],
+    "split-down":  ["<Meta><Shift>d"],
+    "close-pane":  ["<Meta><Shift>w"],
+    "focus-left":  ["<Meta><Alt>Left"],
+    "focus-right": ["<Meta><Alt>Right"],
+    "focus-up":    ["<Meta><Alt>Up"],
+    "focus-down":  ["<Meta><Alt>Down"],
+}
 
 
 class Window(Adw.ApplicationWindow):
@@ -357,10 +652,13 @@ class Window(Adw.ApplicationWindow):
 
         tabbar = Adw.TabBar(view=self.tabview, autohide=False, expand_tabs=False)
 
-        new_btn = Gtk.Button(icon_name="tab-new-symbolic", tooltip_text="New Tab (Ctrl+Shift+T)")
+        new_btn = Gtk.Button(
+            icon_name="tab-new-symbolic",
+            tooltip_text=f"New Tab ({'Cmd+T' if IS_MAC else 'Ctrl+Shift+T'})")
         new_btn.set_action_name("win.new-tab")
-        prefs_btn = Gtk.Button(icon_name="emblem-system-symbolic",
-                               tooltip_text="Preferences (Ctrl+,)")
+        prefs_btn = Gtk.Button(
+            icon_name="emblem-system-symbolic",
+            tooltip_text=f"Preferences ({'Cmd+,' if IS_MAC else 'Ctrl+,'})")
         prefs_btn.set_action_name("win.preferences")
         header = Adw.HeaderBar()
         header.pack_start(new_btn)
@@ -391,8 +689,23 @@ class Window(Adw.ApplicationWindow):
             ("zoom-in",     self.action_zoom_in,     ["<Control>plus", "<Control>equal"]),
             ("zoom-out",    self.action_zoom_out,    ["<Control>minus"]),
             ("zoom-reset",  self.action_zoom_reset,  ["<Control>0"]),
+            ("split-right", self.action_split_right, ["<Control><Shift>d"]),
+            ("split-down",  self.action_split_down,  ["<Control><Shift>e"]),
+            ("close-pane",  self.action_close_pane,  ["<Control><Shift>x"]),
+            ("focus-left",  self.action_focus_left,  ["<Alt>Left"]),
+            ("focus-right", self.action_focus_right, ["<Alt>Right"]),
+            ("focus-up",    self.action_focus_up,    ["<Alt>Up"]),
+            ("focus-down",  self.action_focus_down,  ["<Alt>Down"]),
         ]
         for name, cb, accels in specs:
+            if IS_MAC:
+                # Option+arrow is a line-editing key inside the tab (see
+                # MAC_ALT_KEYS), so on macOS the Alt bindings are replaced
+                # rather than added to — an accelerator would win first and
+                # the shell would never see the key.
+                accels = MAC_ACCELS.get(name, []) + [
+                    a for a in accels if "<Alt>" not in a
+                ]
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", cb)
             self.add_action(act)
@@ -403,7 +716,10 @@ class Window(Adw.ApplicationWindow):
         goto.connect("activate", self.action_goto_tab)
         self.add_action(goto)
         for i in range(1, 10):
-            self.app.set_accels_for_action(f"win.goto-tab({i})", [f"<Alt>{i}"])
+            # Alt+digit types an accented character on a Mac keyboard, so there
+            # the jump lives on Cmd+digit, which is what Terminal.app uses too.
+            accel = f"<Meta>{i}" if IS_MAC else f"<Alt>{i}"
+            self.app.set_accels_for_action(f"win.goto-tab({i})", [accel])
 
     def action_new_tab(self, *_):
         cur = self.current_terminal()
@@ -454,29 +770,218 @@ class Window(Adw.ApplicationWindow):
         if t:
             t.set_font_scale(1.0)
 
+    # ---- panes -----------------------------------------------------------
+    def action_split_right(self, *_):
+        self.split_pane(Gtk.Orientation.HORIZONTAL)
+
+    def action_split_down(self, *_):
+        self.split_pane(Gtk.Orientation.VERTICAL)
+
+    def action_focus_left(self, *_):
+        self.focus_pane("left")
+
+    def action_focus_right(self, *_):
+        self.focus_pane("right")
+
+    def action_focus_up(self, *_):
+        self.focus_pane("up")
+
+    def action_focus_down(self, *_):
+        self.focus_pane("down")
+
+    def action_close_pane(self, *_):
+        """Close the focused pane. An unsplit tab has no pane to close, so
+        there the key closes the tab — one key, one meaning either way."""
+        term = self.current_terminal()
+        leaf = getattr(term, "leaf", None) if term else None
+        if not isinstance(leaf.get_parent() if leaf else None, Gtk.Paned):
+            self.action_close_tab()
+            return
+
+        mode = self.app.config["confirm_close"]
+        busy = term.busy() if mode != "never" else None
+        if mode == "never" or (mode != "always" and busy is None):
+            self.close_pane(term)
+            return
+        name = term.display_title()
+        if busy:
+            kind, cmd = busy
+            body = (f"“{name}” {self.BUSY_PHRASE[kind].format(cmd=cmd)}. "
+                    "Closing the pane kills it.")
+        else:
+            body = f"Close the “{name}” pane?"
+
+        def answered(ok):
+            if ok:
+                self.close_pane(term)
+            else:
+                term.grab_focus()
+
+        self._confirm("Close Pane?", body, "Close Pane", answered)
+
+    def split_pane(self, orientation):
+        """Split the focused pane in two, the new half opening in the same
+        directory. A split stays inside its tab: the tab bar does not change,
+        and closing the last pane closes the tab."""
+        term = self.current_terminal()
+        leaf = getattr(term, "leaf", None) if term else None
+        parent = leaf.get_parent() if leaf else None
+        if parent is None:
+            return None
+        paned = Gtk.Paned(
+            orientation=orientation, resize_start_child=True,
+            resize_end_child=True, shrink_start_child=False,
+            shrink_end_child=False)
+        new = Terminal(self.app, cwd=term.cwd)
+        new.page = term.page
+        # Dropping the split in where the pane was detaches the pane, which is
+        # what lets it be re-parented underneath: GTK refuses a child that
+        # still belongs to somebody else.
+        replace_pane(parent, leaf, paned)
+        paned.set_start_child(leaf)
+        paned.set_end_child(wrap_terminal(new))
+        place_divider(paned, 0.5)
+        focus_soon(new)
+        self.app.schedule_session_save()
+        return new
+
+    def close_pane(self, term):
+        """Remove one pane and collapse the split it lived in. Returns False
+        when it was the only pane in its tab — that is a tab close, and the
+        caller owns the difference."""
+        leaf = getattr(term, "leaf", None)
+        paned = leaf.get_parent() if leaf else None
+        if not isinstance(paned, Gtk.Paned):
+            return False
+        sibling = (paned.get_end_child() if paned.get_start_child() is leaf
+                   else paned.get_start_child())
+        page = term.page
+        paned.set_start_child(None)
+        paned.set_end_child(None)
+        replace_pane(paned.get_parent(), paned, sibling)
+
+        # Cut the terminal loose before hanging its shell up: the death of
+        # the shell comes back as child-exited, which closes the terminal
+        # again, and a pane with no leaf left is one this already handled.
+        term.leaf = None
+        term.page = None
+        # Hang the shell up rather than trusting the widget going away to do
+        # it. VTE gives every terminal its own session, so the pid is the
+        # process group the kernel would signal if this were a real terminal
+        # closing — which, for that shell, it is.
+        if term.child_pid:
+            try:
+                os.killpg(term.child_pid, signal.SIGHUP)
+            except OSError:
+                pass
+
+        remaining = pane_terminals(page) if page else []
+        if page and getattr(page, "smt_terminal", None) is term:
+            page.smt_terminal = remaining[0] if remaining else None
+        if remaining:
+            (getattr(page, "smt_terminal", None) or remaining[0]).grab_focus()
+        self.app.schedule_session_save()
+        return True
+
+    def focus_pane(self, direction):
+        """Move the keyboard to the nearest pane on that side.
+
+        Nearest by geometry rather than by position in the tree: with nested
+        splits the tree order stops matching what you see, and the pane you
+        mean is always the one your eye lands on.
+        """
+        term = self.current_terminal()
+        page = self.tabview.get_selected_page()
+        here = self._pane_bounds(term) if (term and page) else None
+        if here is None:
+            return
+        horizontal = direction in ("left", "right")
+        best = best_gap = None
+        for other in pane_terminals(page):
+            if other is term:
+                continue
+            there = self._pane_bounds(other)
+            if there is None:
+                continue
+            if horizontal:
+                gap = (here.origin.x - (there.origin.x + there.size.width)
+                       if direction == "left"
+                       else there.origin.x - (here.origin.x + here.size.width))
+                overlap = (min(here.origin.y + here.size.height,
+                               there.origin.y + there.size.height)
+                           - max(here.origin.y, there.origin.y))
+            else:
+                gap = (here.origin.y - (there.origin.y + there.size.height)
+                       if direction == "up"
+                       else there.origin.y - (here.origin.y + here.size.height))
+                overlap = (min(here.origin.x + here.size.width,
+                               there.origin.x + there.size.width)
+                           - max(here.origin.x, there.origin.x))
+            # It has to lie on that side of us, and to share some edge with
+            # us: a pane diagonally across the tab is not "to the left".
+            if gap < -1 or overlap <= 0:
+                continue
+            if best_gap is None or gap < best_gap:
+                best, best_gap = other, gap
+        if best:
+            best.grab_focus()
+
+    def _pane_bounds(self, term):
+        ok, rect = term.compute_bounds(self)
+        return rect if ok else None
+
     # ---- tabs ------------------------------------------------------------
-    def add_tab(self, cwd=None, title=None, select=True):
-        term = Terminal(self.app, cwd=cwd)
-        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroller.set_child(term)
-        page = self.tabview.append(scroller)
-        term.page = page
-        page.smt_terminal = term
-        if title:
-            term.custom_title = title
-        term.refresh_title()
+    def add_tab(self, cwd=None, title=None, select=True, layout=None):
+        """Open a tab. `layout` rebuilds a saved pane tree; without one the
+        tab starts as a single pane, which is what most of them stay."""
+        if layout is None:
+            layout = {"cwd": cwd, "title": title}
+        root = Adw.Bin()
+        root.set_child(self._build_pane(layout))
+        page = self.tabview.append(root)
+        terms = pane_terminals(page)
+        if not terms:
+            return None
+        for term in terms:
+            term.page = page
+        # Until a pane takes focus the first one speaks for the tab.
+        page.smt_terminal = terms[0]
+        terms[0].refresh_title()
         if select:
             self.tabview.set_selected_page(page)
-            term.grab_focus()
-        return term
+            terms[0].grab_focus()
+        return terms[0]
+
+    def _build_pane(self, node):
+        """One saved layout node back into widgets."""
+        children = node.get("children")
+        if children and len(children) == 2:
+            paned = Gtk.Paned(
+                orientation=(Gtk.Orientation.HORIZONTAL
+                             if node.get("split") == "h"
+                             else Gtk.Orientation.VERTICAL),
+                resize_start_child=True, resize_end_child=True,
+                shrink_start_child=False, shrink_end_child=False)
+            paned.set_start_child(self._build_pane(children[0]))
+            paned.set_end_child(self._build_pane(children[1]))
+            place_divider(paned, float(node.get("ratio") or 0.5))
+            return paned
+        term = Terminal(self.app, cwd=node.get("cwd") or None)
+        if node.get("title"):
+            term.custom_title = node["title"]
+        return wrap_terminal(term)
 
     def terminals(self):
+        """Every terminal in the window, panes included."""
         out = []
         for i in range(self.tabview.get_n_pages()):
-            term = getattr(self.tabview.get_nth_page(i), "smt_terminal", None)
-            if term:
-                out.append(term)
+            out.extend(pane_terminals(self.tabview.get_nth_page(i)))
         return out
+
+    def session_layout(self):
+        layouts = (layout_of(self.tabview.get_nth_page(i))
+                   for i in range(self.tabview.get_n_pages()))
+        return [{"layout": layout} for layout in layouts if layout]
 
     def current_terminal(self):
         page = self.tabview.get_selected_page()
@@ -484,7 +989,10 @@ class Window(Adw.ApplicationWindow):
 
     def close_terminal(self, term):
         # Only reached when the shell itself exited, so there is nothing left
-        # to ask about.
+        # to ask about. In a split tab that is one pane going away, not the
+        # tab: the other panes are still running.
+        if self.close_pane(term):
+            return
         term.force_close = True
         if term.page:
             self.tabview.close_page(term.page)
@@ -509,12 +1017,16 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _on_close_page(self, tabview, page):
-        term = getattr(page, "smt_terminal", None)
+        terms = pane_terminals(page)
+        term = getattr(page, "smt_terminal", None) or (terms[0] if terms else None)
         mode = self.app.config["confirm_close"]
-        busy = term.busy() if term else None
+        # Closing a split tab closes every pane in it, so any busy pane is
+        # reason enough to ask — and it is the one worth naming.
+        busy_term, busy = next(
+            ((t, state) for t in terms if (state := t.busy())), (term, None))
         ask = (
             term is not None
-            and not term.force_close
+            and not any(t.force_close for t in terms)
             and mode != "never"
             and (mode == "always" or busy is not None)
         )
@@ -525,11 +1037,13 @@ class Window(Adw.ApplicationWindow):
         # AdwTabView lets the close run asynchronously: the page sits in a
         # closing state until close_page_finish, which is what makes a dialog
         # here possible at all.
-        name = term.display_title()
+        name = busy_term.display_title()
         if busy:
             kind, cmd = busy
             body = (f"“{name}” {self.BUSY_PHRASE[kind].format(cmd=cmd)}. "
                     "Closing the tab kills it.")
+        elif len(terms) > 1:
+            body = f"Close “{name}” and its {len(terms)} panes?"
         else:
             body = f"Close “{name}”?"
         self._confirm("Close Tab?", body, "Close Tab",
@@ -812,9 +1326,7 @@ class App(Adw.Application):
         self.config = {**DEFAULT_CONFIG, **load_json(CONFIG_PATH, {})}
         self.attention_icon = dot_icon(self.config["attention_color"])
         self.window = None
-        self.socket_path = os.path.join(
-            GLib.get_user_runtime_dir(), f"smt-{os.getpid()}.sock"
-        )
+        self.socket_path = SOCKET_PATH
         self._service = None
         self._save_source = 0
         self.add_main_option(
@@ -825,11 +1337,40 @@ class App(Adw.Application):
     # ---- lifecycle -------------------------------------------------------
     def do_command_line(self, command_line):
         opts = command_line.get_options_dict().end().unpack()
+        cwd = option_path(opts.get("working-directory"))
+        cwd = os.path.abspath(cwd) if cwd else None
+        if self.window is None and self._forward_to_running_instance(cwd):
+            return 0
         self.activate()
-        cwd = opts.get("working-directory")
         if cwd:
-            self.window.add_tab(cwd=os.path.abspath(cwd))
+            self.window.add_tab(cwd=cwd)
         return 0
+
+    def _forward_to_running_instance(self, cwd):
+        """Hand this launch to an instance that is already up, and report
+        whether it was taken.
+
+        GApplication's own uniqueness rides on a D-Bus session bus, which macOS
+        does not have, so without this every launch becomes a second window —
+        and two windows restoring and then saving the same session.json means
+        whichever quits last silently discards the other one's tabs. The
+        notification socket is already listening, so it does the introduction.
+        A refused connection means the socket outlived the process that made
+        it, and this launch is the real instance.
+        """
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(2.0)
+                sock.connect(SOCKET_PATH)
+                sock.sendall((json.dumps({"kind": "open", "cwd": cwd}) + "\n").encode())
+                reply = sock.recv(16)
+        except OSError as exc:
+            debug("no instance to hand this launch to", exc)
+            return False
+        taken = reply.startswith(b"ok")
+        debug("handed this launch to the running instance" if taken
+              else "running instance refused this launch")
+        return taken
 
     def do_activate(self):
         if self.window:
@@ -852,10 +1393,15 @@ class App(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def _cleanup_socket(self):
-        if self._service:
-            self._service.stop()
-            self._service.close()
-            self._service = None
+        # Only the instance that bound the socket may remove it. A launch that
+        # handed itself over to a running instance shuts down through here too,
+        # and deleting the path on the way out would leave the survivor
+        # unreachable to every launch after it.
+        if not self._service:
+            return
+        self._service.stop()
+        self._service.close()
+        self._service = None
         try:
             os.unlink(self.socket_path)
         except OSError:
@@ -886,9 +1432,16 @@ class App(Adw.Application):
         if self.config["restore_session"]:
             tabs = load_json(SESSION_PATH, {}).get("tabs", [])
         for tab in tabs:
-            cwd = tab.get("cwd")
-            if cwd and os.path.isdir(cwd):
-                self.window.add_tab(cwd=cwd, title=tab.get("title"), select=False)
+            # An unmounted volume or a deleted project must not silently cost
+            # you the tab — and dropping it here would also erase it from the
+            # session on the next save. Terminal._spawn already falls back to
+            # home for a directory it cannot enter, and the name survives.
+            #
+            # Sessions written before splits existed stored one directory per
+            # tab; that is simply a pane tree of one leaf.
+            layout = tab.get("layout") or {"cwd": tab.get("cwd"),
+                                           "title": tab.get("title")}
+            self.window.add_tab(layout=layout, select=False)
         if self.window.tabview.get_n_pages() == 0:
             self.window.add_tab()
         else:
@@ -909,39 +1462,20 @@ class App(Adw.Application):
     def save_session(self):
         if not self.window:
             return
-        tabs = [
-            {"cwd": t.cwd, "title": t.custom_title}
-            for t in self.window.terminals()
-        ]
+        tabs = self.window.session_layout()
+        if not tabs:
+            # Having no tabs at all means the window is coming apart — a
+            # logout, a SIGHUP, the shells killed out from under it — not you
+            # closing them one by one. Writing the empty list would erase the
+            # session those tabs came from, so leave the last good one alone.
+            debug("not saving an empty session")
+            return
         save_json(SESSION_PATH, {"tabs": tabs})
 
     # ---- notifications ---------------------------------------------------
-    def _sweep_stale_sockets(self):
-        """Remove sockets from instances that were killed instead of closed."""
-        runtime = GLib.get_user_runtime_dir()
-        try:
-            names = os.listdir(runtime)
-        except OSError:
-            return
-        for name in names:
-            if not (name.startswith("smt-") and name.endswith(".sock")):
-                continue
-            try:
-                pid = int(name[4:-5])
-            except ValueError:
-                continue
-            if pid == os.getpid():
-                continue
-            if os.path.isdir(f"/proc/{pid}"):
-                continue  # still running
-            try:
-                os.unlink(os.path.join(runtime, name))
-                debug("swept stale socket", name)
-            except OSError:
-                pass
-
     def _start_socket(self):
-        self._sweep_stale_sockets()
+        # Safe to take the path over: we only get here once nobody answered on
+        # it, so anything still sitting there is a leftover from a crash.
         try:
             os.unlink(self.socket_path)
         except OSError:
@@ -955,6 +1489,7 @@ class App(Adw.Application):
             )
         except GLib.Error as exc:
             print(f"smt: notification socket unavailable: {exc.message}", file=sys.stderr)
+            self._service = None    # nothing bound, so nothing to clean up
             return
         self._service.connect("incoming", self._on_socket_incoming)
         self._service.start()
@@ -971,9 +1506,14 @@ class App(Adw.Application):
             line = None
         if line:
             try:
-                self._handle_message(json.loads(bytes(line).decode()))
+                reply = self._handle_message(json.loads(bytes(line).decode()))
             except (ValueError, UnicodeDecodeError):
-                pass
+                reply = None
+            if reply:
+                try:
+                    connection.get_output_stream().write_all(reply, None)
+                except GLib.Error:
+                    pass
         try:
             connection.close(None)
         except GLib.Error:
@@ -988,12 +1528,24 @@ class App(Adw.Application):
         return None
 
     def _handle_message(self, msg):
+        """Act on one socket message, returning a reply for the kinds that
+        need one. Only "open" does: the sender has to know whether to exit or
+        to carry on becoming the instance itself."""
         debug("recv", msg)
+        kind = msg.get("kind")
+
+        if kind == "open":
+            if not self.window:
+                return None     # still starting up; let the caller be its own
+            if msg.get("cwd"):
+                self.window.add_tab(cwd=msg["cwd"])
+            self.window.present()
+            return b"ok\n"
+
         term = self._find_terminal(msg.get("tab_id", ""))
         if not term:
             debug("no terminal for tab_id", msg.get("tab_id"))
-            return
-        kind = msg.get("kind")
+            return None
 
         if kind == "command-done":
             if not self.config["notify_on_command_done"]:
@@ -1028,10 +1580,34 @@ class App(Adw.Application):
             return
         term.set_attention(True, f"{title} — {body}")
 
-        notification = Gio.Notification.new(title)
-        notification.set_body(f"{term.display_title()} — {body}")
-        notification.set_priority(Gio.NotificationPriority.NORMAL)
-        self.send_notification(f"smt-{term.tab_id}", notification)
+        self.desktop_notify(f"smt-{term.tab_id}", title,
+                            f"{term.display_title()} — {body}")
+
+    # GNotification is the right tool on Linux, where the shell owns the tray
+    # and withdrawing works. On macOS it has no usable backend — its Cocoa path
+    # wants an app bundle — so notifications go out through a helper instead:
+    # terminal-notifier when installed, because it alone can pull a
+    # notification back, and otherwise osascript, which every Mac already has.
+    def desktop_notify(self, ident, title, body):
+        if not IS_MAC:
+            notification = Gio.Notification.new(title)
+            notification.set_body(body)
+            notification.set_priority(Gio.NotificationPriority.NORMAL)
+            self.send_notification(ident, notification)
+        elif TERMINAL_NOTIFIER:
+            _spawn_detached([TERMINAL_NOTIFIER, "-title", title,
+                             "-message", body, "-group", ident])
+        else:
+            _spawn_detached(["osascript", "-e", "display notification "
+                             f"{_applescript_string(body)} with title "
+                             f"{_applescript_string(title)}"])
+
+    def desktop_withdraw(self, ident):
+        if not IS_MAC:
+            self.withdraw_notification(ident)
+        elif TERMINAL_NOTIFIER:
+            _spawn_detached([TERMINAL_NOTIFIER, "-remove", ident])
+        # Plain osascript notifications cannot be recalled; they age out.
 
 
 def main():
