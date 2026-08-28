@@ -23,6 +23,15 @@ import sys  # noqa: E402
 import uuid  # noqa: E402
 from urllib.parse import unquote, urlparse  # noqa: E402
 
+# Roughly the smallest a pane is allowed to get, in character cells — the
+# scroller's own chrome can eat a cell. Gtk.Paned only refuses to shrink a
+# child past that child's own minimum, and VTE asks for barely two columns,
+# so without a floor a divider drags a pane down to a width no shell can
+# draw a prompt into: bash redraws its prompt on every SIGWINCH and the
+# fragments pile up as garbage that outlives the resize.
+MIN_PANE_COLUMNS = 20
+MIN_PANE_ROWS = 4
+
 APP_ID = "dev.phuongld.SimpleTerm"
 APP_NAME = "SMT"          # what shows in the window title and task switcher
 CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "simple-multi-terminal")
@@ -198,9 +207,24 @@ class Terminal(Vte.Terminal):
         )
         self.set_scroll_on_output(bool(cfg["scroll_on_output"]))
         self.set_scroll_on_keystroke(bool(cfg["scroll_on_keystroke"]))
+        self.apply_min_size()
         # Recolouring the dot only shows up on tabs currently wearing one.
         if self.attention_reason and self.page:
             self.page.set_indicator_icon(self.app.attention_icon)
+
+    def apply_min_size(self):
+        """Stop this pane from being squeezed into nonsense.
+
+        The request goes on the leaf rather than the terminal: a
+        Gtk.ScrolledWindow passes its child's minimum width through but not
+        its minimum height, so asking the terminal alone would floor the
+        width and leave a pane that still drags down to a single row. Cell
+        size follows the font, which is why this is re-run on every config
+        change rather than fixed once at construction."""
+        if self.leaf is None:
+            return
+        self.leaf.set_size_request(self.get_char_width() * MIN_PANE_COLUMNS,
+                                   self.get_char_height() * MIN_PANE_ROWS)
 
     # ---- shell -----------------------------------------------------------
     def _child_env(self):
@@ -391,6 +415,7 @@ def wrap_terminal(term):
     scroller.set_child(term)
     scroller.smt_terminal = term
     term.leaf = scroller
+    term.apply_min_size()
     return scroller
 
 
