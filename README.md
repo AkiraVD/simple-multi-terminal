@@ -1,8 +1,9 @@
 # simple-multi-terminal
 
-A small GTK4/VTE terminal for claude code that does four things and nothing else.
+A small GTK4/VTE terminal for claude code that does five things and nothing else.
 
 - **Multiple tabs**
+- **Split panes** — several terminals side by side in one tab
 - **Tab rename**
 - **Notifications** when Claude Code wants your input, or a long command finishes in a background tab
 - **Persistent project paths** — tabs come back in the directories you left them
@@ -48,8 +49,39 @@ Open a new tab or `source ~/.bashrc` for the shell integration to take effect.
 | `Alt+1`…`Alt+9`       | jump to tab         |
 | `Ctrl+±` / `Ctrl+0`   | font size           |
 | `Ctrl+,`              | preferences         |
+| `Ctrl+Shift+D`        | split right         |
+| `Ctrl+Shift+E`        | split down          |
+| `Ctrl+Shift+X`        | close pane          |
+| `Alt+←↑↓→`            | move between panes  |
 
-Tabs also rename from the right-click menu, and drag to reorder.
+Tabs also rename from the right-click menu, and drag to reorder. Splitting is
+also in the right-click menu.
+
+`Alt+←→` and `Alt+↑↓` are window accelerators, so they no longer reach the
+shell or a full-screen program inside a tab.
+
+## Splits
+
+`Ctrl+Shift+D` cuts the pane you are in half, the new half opening in the same
+directory. Splits nest, so a pane can be split again in either direction, and
+every divider drags. The tab bar does not change: a split lives inside one tab,
+however many panes it grows.
+
+Moving between panes goes by geometry, not by the order they were created in —
+`Alt+→` is whichever pane your eye lands on to the right, which stops matching
+the tree as soon as splits nest.
+
+Closing follows the panes. `Ctrl+Shift+X` closes one and the split collapses
+back; in a tab with a single pane there is nothing to collapse, so the same key
+closes the tab. A shell that exits on its own takes only its own pane with it.
+Closing the tab closes all of them, and asks first if any one of them is busy —
+naming the busy one, not the tab.
+
+The pane you are typing in is the one its tab speaks for: it owns the tab's
+title, and a notification in *any* pane badges the tab, including a background
+pane of the tab you are looking at. That last part is the point — Claude
+working in the right-hand pane still tells you it needs an answer while you
+carry on in the left.
 
 ## How the notifications work
 
@@ -109,15 +141,29 @@ Outside the terminal it silently does nothing, so it is safe in shared scripts.
 ## How paths persist
 
 The shell reports its directory via OSC 7 on every prompt. The terminal tracks
-that per tab, writes `~/.local/share/simple-multi-terminal/session.json`
+that per pane, writes `~/.local/share/simple-multi-terminal/session.json`
 (debounced, 2s), and restores those directories on next launch. A new tab opens
-in the current tab's directory.
+in the current pane's directory.
+
+What is saved is the shape of each tab, not just a path: the splits come back
+in the same directions with their dividers where you left them, including on
+tabs you have not switched to yet. The tab you were on comes back selected and
+holding the keyboard, and the order you dragged your tabs into is kept.
+Sessions written before splits or the remembered selection existed still load —
+one directory per tab is a tree of one pane, and no recorded selection means
+the first tab.
+
+A tab whose directory is gone — an unmounted volume, a deleted project — comes
+back at your home directory, keeping its name. Dropping it instead would erase
+it from the session on the next save, so a volume you forgot to plug in would
+cost you the tab permanently.
 
 ## Closing a tab
 
 Closing a tab that is busy asks first. The `×` on the tab and `Ctrl+Shift+W`
 both go through the same guard, and so does closing the whole window — that
-dialog lists every tab still running something.
+dialog lists every pane still running something. `Ctrl+Shift+X` asks on the
+same terms before killing one pane.
 
 Two settings, deliberately separate: `confirm_close` decides *when* to ask,
 `count_as_busy` decides *what counts*.
@@ -141,8 +187,8 @@ it on will flag tabs you think of as idle.
 
 None of this is guesswork about terminal output. `foreground` reads the pty's
 foreground process group, which is the shell itself when nothing is running.
-The other two walk `/proc` for processes sharing the tab's session id — the
-same set the kernel would `SIGHUP` if the tab went away. So the dialog names
+The other two walk `/proc` for processes sharing the pane's session id — the
+same set the kernel would `SIGHUP` if the pane went away. So the dialog names
 the actual command: *"api" is still running pytest.*
 
 Cancel is the default response, so Enter and Escape both back out.

@@ -18,9 +18,19 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 import json  # noqa: E402
+import signal  # noqa: E402
 import sys  # noqa: E402
 import uuid  # noqa: E402
 from urllib.parse import unquote, urlparse  # noqa: E402
+
+# Roughly the smallest a pane is allowed to get, in character cells — the
+# scroller's own chrome can eat a cell. Gtk.Paned only refuses to shrink a
+# child past that child's own minimum, and VTE asks for barely two columns,
+# so without a floor a divider drags a pane down to a width no shell can
+# draw a prompt into: bash redraws its prompt on every SIGWINCH and the
+# fragments pile up as garbage that outlives the resize.
+MIN_PANE_COLUMNS = 20
+MIN_PANE_ROWS = 4
 
 APP_ID = "dev.phuongld.SimpleTerm"
 APP_NAME = "SMT"          # what shows in the window title and task switcher
@@ -155,6 +165,7 @@ class Terminal(Vte.Terminal):
         self.app = app
         self.tab_id = uuid.uuid4().hex[:12]
         self.page = None
+        self.leaf = None           # the scroller this pane sits in, if split
         self.custom_title = None   # set once the user renames; locks out OSC titles
         self.osc_title = None
         self.cwd = cwd or os.path.expanduser("~")
@@ -174,6 +185,11 @@ class Terminal(Vte.Terminal):
         self.connect("current-directory-uri-changed", self._on_cwd_changed)
         self.connect("setup-context-menu", self._on_context_menu)
 
+        # Which pane has the keyboard decides which one its tab speaks for.
+        focus = Gtk.EventControllerFocus()
+        focus.connect("enter", self._on_focus_enter)
+        self.add_controller(focus)
+
         self._spawn()
 
     # ---- settings --------------------------------------------------------
@@ -191,9 +207,24 @@ class Terminal(Vte.Terminal):
         )
         self.set_scroll_on_output(bool(cfg["scroll_on_output"]))
         self.set_scroll_on_keystroke(bool(cfg["scroll_on_keystroke"]))
+        self.apply_min_size()
         # Recolouring the dot only shows up on tabs currently wearing one.
         if self.attention_reason and self.page:
             self.page.set_indicator_icon(self.app.attention_icon)
+
+    def apply_min_size(self):
+        """Stop this pane from being squeezed into nonsense.
+
+        The request goes on the leaf rather than the terminal: a
+        Gtk.ScrolledWindow passes its child's minimum width through but not
+        its minimum height, so asking the terminal alone would floor the
+        width and leave a pane that still drags down to a single row. Cell
+        size follows the font, which is why this is re-run on every config
+        change rather than fixed once at construction."""
+        if self.leaf is None:
+            return
+        self.leaf.set_size_request(self.get_char_width() * MIN_PANE_COLUMNS,
+                                   self.get_char_height() * MIN_PANE_ROWS)
 
     # ---- shell -----------------------------------------------------------
     def _child_env(self):
@@ -236,6 +267,8 @@ class Terminal(Vte.Terminal):
         in this tab" — and it is the same grouping the kernel would SIGHUP if
         the tab went away.
         """
+        if self.child_pid is None:
+            return []
         found = []
         for name in os.listdir("/proc"):
             if not name.isdigit() or int(name) == self.child_pid:
@@ -297,12 +330,22 @@ class Terminal(Vte.Terminal):
         return os.path.basename(self.cwd.rstrip("/")) or "/"
 
     def refresh_title(self):
-        if self.page:
+        # In a split tab only the focused pane names the tab; the others would
+        # otherwise take turns overwriting it every time their prompt changed.
+        if self.page and getattr(self.page, "smt_terminal", None) is self:
             self.page.set_title(self.display_title())
             self.page.set_tooltip(self.cwd)
         window = self.app.window
         if window and window.current_terminal() is self:
             window.set_title(f"{self.display_title()} — {APP_NAME}")
+
+    def _on_focus_enter(self, _controller):
+        """Take over as the pane this tab speaks for: its title becomes the
+        tab's, and its pending notification has now been read."""
+        if self.page and getattr(self.page, "smt_terminal", None) is not self:
+            self.page.smt_terminal = self
+            self.refresh_title()
+        self.set_attention(False)
 
     def _on_osc_title(self, _t):
         title = (self.get_window_title() or "").strip()
@@ -321,6 +364,10 @@ class Terminal(Vte.Terminal):
         menu = Gio.Menu()
         menu.append("Copy", "win.copy")
         menu.append("Paste", "win.paste")
+        splits = Gio.Menu()
+        splits.append("Split Right", "win.split-right")
+        splits.append("Split Down", "win.split-down")
+        menu.append_section(None, splits)
         section = Gio.Menu()
         section.append("Rename Tab…", "win.rename-tab")
         section.append("New Tab", "win.new-tab")
@@ -354,6 +401,132 @@ class Terminal(Vte.Terminal):
             self.app.notify_tab(self, "Bell", self.display_title())
 
 
+# ---- pane tree -----------------------------------------------------------
+# A tab holds a tree, not a terminal: Gtk.Paned for every split, and at the
+# leaves a Gtk.ScrolledWindow around one terminal. The scroller carries an
+# `smt_terminal` attribute, which is what makes a leaf recognisable while
+# walking the tree without having to guess at widget types. The root of each
+# tab is an Adw.Bin, because an AdwTabPage's child cannot be swapped after the
+# page is created and splitting has to swap it.
+
+def wrap_terminal(term):
+    """Put a terminal in the widget the pane tree actually moves around."""
+    scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
+    scroller.set_child(term)
+    scroller.smt_terminal = term
+    term.leaf = scroller
+    term.apply_min_size()
+    return scroller
+
+
+def pane_terminals(node):
+    """Every terminal under a widget, or under a tab page, left to right."""
+    if isinstance(node, Adw.TabPage):
+        node = node.get_child()
+    term = getattr(node, "smt_terminal", None)
+    if term is not None:
+        return [term]
+    if isinstance(node, Gtk.Paned):
+        return (pane_terminals(node.get_start_child())
+                + pane_terminals(node.get_end_child()))
+    if isinstance(node, Adw.Bin):
+        return pane_terminals(node.get_child())
+    return []
+
+
+def replace_pane(parent, old, new):
+    """Swap one child of a pane-tree node, whichever slot it occupies."""
+    if isinstance(parent, Gtk.Paned):
+        if parent.get_start_child() is old:
+            parent.set_start_child(new)
+        else:
+            parent.set_end_child(new)
+    else:
+        parent.set_child(new)      # an Adw.Bin: the root of one tab
+
+
+def place_divider(paned, ratio):
+    """Put a divider at a fraction of the split it belongs to.
+
+    The position is measured in pixels, so setting it before the split has
+    been allocated measures against a width of zero and lands every divider
+    on the left edge — a split that opens fully collapsed. A restored tab
+    that is not the one you are looking at is never allocated at all until
+    you switch to it, which can be minutes, so wait on the tab appearing
+    rather than on a timeout that would expire long before.
+    """
+    def place():
+        horizontal = paned.get_orientation() == Gtk.Orientation.HORIZONTAL
+        span = paned.get_width() if horizontal else paned.get_height()
+        if span <= 1:
+            return False
+        paned.set_position(int(span * ratio))
+        return True
+
+    if place():
+        return
+
+    handler = [0]
+
+    def on_map(widget):
+        frames = [0]
+
+        def settle():
+            # Mapped is not yet measured; the size lands a frame later.
+            frames[0] += 1
+            if place() or frames[0] > 20:
+                if handler[0]:
+                    widget.disconnect(handler[0])
+                    handler[0] = 0
+                return False
+            return True
+
+        GLib.timeout_add(30, settle)
+
+    handler[0] = paned.connect("map", on_map)
+
+
+def layout_of(node):
+    """The saved shape of a pane tree: leaves keep their directory and their
+    name, splits keep their direction and where you left the divider."""
+    if isinstance(node, Adw.TabPage):
+        node = node.get_child()
+    if isinstance(node, Adw.Bin):
+        node = node.get_child()
+    term = getattr(node, "smt_terminal", None)
+    if term is not None:
+        return {"cwd": term.cwd, "title": term.custom_title}
+    if isinstance(node, Gtk.Paned):
+        horizontal = node.get_orientation() == Gtk.Orientation.HORIZONTAL
+        span = node.get_width() if horizontal else node.get_height()
+        children = [layout_of(node.get_start_child()),
+                    layout_of(node.get_end_child())]
+        if not all(children):
+            return None
+        return {
+            "split": "h" if horizontal else "v",
+            "ratio": round(node.get_position() / span, 3) if span > 1 else 0.5,
+            "children": children,
+        }
+    return None
+
+
+def focus_soon(term):
+    """Focus a pane once GTK has laid it out. A widget added this frame has no
+    allocation yet, and an unallocated widget cannot take the keyboard. One
+    frame is enough for a pane added to a window already on screen, but a tab
+    restored at startup is asked before the window has been presented, so keep
+    asking for a few frames rather than giving up on the first refusal."""
+    frames = [0]
+
+    def go():
+        term.grab_focus()
+        frames[0] += 1
+        return not term.has_focus() and frames[0] < 20
+
+    GLib.timeout_add(30, go)
+
+
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title=APP_NAME)
@@ -363,6 +536,7 @@ class Window(Adw.ApplicationWindow):
         self.tabview = Adw.TabView()
         self.tabview.connect("close-page", self._on_close_page)
         self.tabview.connect("notify::selected-page", self._on_page_switched)
+        self.tabview.connect("page-reordered", self._on_page_reordered)
         self.tabview.connect("setup-menu", self._on_setup_menu)
         self._menu_page = None
         self._close_confirmed = False   # set once the user okays closing the window
@@ -404,6 +578,13 @@ class Window(Adw.ApplicationWindow):
             ("zoom-in",     self.action_zoom_in,     ["<Control>plus", "<Control>equal"]),
             ("zoom-out",    self.action_zoom_out,    ["<Control>minus"]),
             ("zoom-reset",  self.action_zoom_reset,  ["<Control>0"]),
+            ("split-right", self.action_split_right, ["<Control><Shift>d"]),
+            ("split-down",  self.action_split_down,  ["<Control><Shift>e"]),
+            ("close-pane",  self.action_close_pane,  ["<Control><Shift>x"]),
+            ("focus-left",  self.action_focus_left,  ["<Alt>Left"]),
+            ("focus-right", self.action_focus_right, ["<Alt>Right"]),
+            ("focus-up",    self.action_focus_up,    ["<Alt>Up"]),
+            ("focus-down",  self.action_focus_down,  ["<Alt>Down"]),
         ]
         for name, cb, accels in specs:
             act = Gio.SimpleAction.new(name, None)
@@ -467,29 +648,230 @@ class Window(Adw.ApplicationWindow):
         if t:
             t.set_font_scale(1.0)
 
+    # ---- panes -----------------------------------------------------------
+    def action_split_right(self, *_):
+        self.split_pane(Gtk.Orientation.HORIZONTAL)
+
+    def action_split_down(self, *_):
+        self.split_pane(Gtk.Orientation.VERTICAL)
+
+    def action_focus_left(self, *_):
+        self.focus_pane("left")
+
+    def action_focus_right(self, *_):
+        self.focus_pane("right")
+
+    def action_focus_up(self, *_):
+        self.focus_pane("up")
+
+    def action_focus_down(self, *_):
+        self.focus_pane("down")
+
+    def action_close_pane(self, *_):
+        """Close the focused pane. An unsplit tab has no pane to close, so
+        there the key closes the tab — one key, one meaning either way."""
+        term = self.current_terminal()
+        leaf = getattr(term, "leaf", None) if term else None
+        if not isinstance(leaf.get_parent() if leaf else None, Gtk.Paned):
+            self.action_close_tab()
+            return
+
+        mode = self.app.config["confirm_close"]
+        busy = term.busy() if mode != "never" else None
+        if mode == "never" or (mode != "always" and busy is None):
+            self.close_pane(term)
+            return
+        name = term.display_title()
+        if busy:
+            kind, cmd = busy
+            body = (f"“{name}” {self.BUSY_PHRASE[kind].format(cmd=cmd)}. "
+                    "Closing the pane kills it.")
+        else:
+            body = f"Close the “{name}” pane?"
+
+        def answered(ok):
+            if ok:
+                self.close_pane(term)
+            else:
+                term.grab_focus()
+
+        self._confirm("Close Pane?", body, "Close Pane", answered)
+
+    def split_pane(self, orientation):
+        """Split the focused pane in two, the new half opening in the same
+        directory. A split stays inside its tab: the tab bar does not change,
+        and closing the last pane closes the tab."""
+        term = self.current_terminal()
+        leaf = getattr(term, "leaf", None) if term else None
+        parent = leaf.get_parent() if leaf else None
+        if parent is None:
+            return None
+        paned = Gtk.Paned(
+            orientation=orientation, resize_start_child=True,
+            resize_end_child=True, shrink_start_child=False,
+            shrink_end_child=False)
+        new = Terminal(self.app, cwd=term.cwd)
+        new.page = term.page
+        # Dropping the split in where the pane was detaches the pane, which is
+        # what lets it be re-parented underneath: GTK refuses a child that
+        # still belongs to somebody else.
+        replace_pane(parent, leaf, paned)
+        paned.set_start_child(leaf)
+        paned.set_end_child(wrap_terminal(new))
+        place_divider(paned, 0.5)
+        focus_soon(new)
+        self.app.schedule_session_save()
+        return new
+
+    def close_pane(self, term):
+        """Remove one pane and collapse the split it lived in. Returns False
+        when it was the only pane in its tab — that is a tab close, and the
+        caller owns the difference."""
+        leaf = getattr(term, "leaf", None)
+        paned = leaf.get_parent() if leaf else None
+        if not isinstance(paned, Gtk.Paned):
+            return False
+        sibling = (paned.get_end_child() if paned.get_start_child() is leaf
+                   else paned.get_start_child())
+        page = term.page
+        paned.set_start_child(None)
+        paned.set_end_child(None)
+        replace_pane(paned.get_parent(), paned, sibling)
+
+        # Cut the terminal loose before hanging its shell up: the death of
+        # the shell comes back as child-exited, which closes the terminal
+        # again, and a pane with no leaf left is one this already handled.
+        term.leaf = None
+        term.page = None
+        # Hang the shell up rather than trusting the widget going away to do
+        # it. VTE gives every terminal its own session, so the pid is the
+        # process group the kernel would signal if this were a real terminal
+        # closing — which, for that shell, it is.
+        if term.child_pid:
+            try:
+                os.killpg(term.child_pid, signal.SIGHUP)
+            except OSError:
+                pass
+
+        remaining = pane_terminals(page) if page else []
+        if page and getattr(page, "smt_terminal", None) is term:
+            page.smt_terminal = remaining[0] if remaining else None
+        if remaining:
+            (getattr(page, "smt_terminal", None) or remaining[0]).grab_focus()
+        self.app.schedule_session_save()
+        return True
+
+    def focus_pane(self, direction):
+        """Move the keyboard to the nearest pane on that side.
+
+        Nearest by geometry rather than by position in the tree: with nested
+        splits the tree order stops matching what you see, and the pane you
+        mean is always the one your eye lands on.
+        """
+        term = self.current_terminal()
+        page = self.tabview.get_selected_page()
+        here = self._pane_bounds(term) if (term and page) else None
+        if here is None:
+            return
+        horizontal = direction in ("left", "right")
+        best = best_gap = None
+        for other in pane_terminals(page):
+            if other is term:
+                continue
+            there = self._pane_bounds(other)
+            if there is None:
+                continue
+            if horizontal:
+                gap = (here.origin.x - (there.origin.x + there.size.width)
+                       if direction == "left"
+                       else there.origin.x - (here.origin.x + here.size.width))
+                overlap = (min(here.origin.y + here.size.height,
+                               there.origin.y + there.size.height)
+                           - max(here.origin.y, there.origin.y))
+            else:
+                gap = (here.origin.y - (there.origin.y + there.size.height)
+                       if direction == "up"
+                       else there.origin.y - (here.origin.y + here.size.height))
+                overlap = (min(here.origin.x + here.size.width,
+                               there.origin.x + there.size.width)
+                           - max(here.origin.x, there.origin.x))
+            # It has to lie on that side of us, and to share some edge with
+            # us: a pane diagonally across the tab is not "to the left".
+            if gap < -1 or overlap <= 0:
+                continue
+            if best_gap is None or gap < best_gap:
+                best, best_gap = other, gap
+        if best:
+            best.grab_focus()
+
+    def _pane_bounds(self, term):
+        ok, rect = term.compute_bounds(self)
+        return rect if ok else None
+
     # ---- tabs ------------------------------------------------------------
-    def add_tab(self, cwd=None, title=None, select=True):
-        term = Terminal(self.app, cwd=cwd)
-        scroller = Gtk.ScrolledWindow(hscrollbar_policy=Gtk.PolicyType.NEVER)
-        scroller.set_child(term)
-        page = self.tabview.append(scroller)
-        term.page = page
-        page.smt_terminal = term
-        if title:
-            term.custom_title = title
-        term.refresh_title()
+    def add_tab(self, cwd=None, title=None, select=True, layout=None):
+        """Open a tab. `layout` rebuilds a saved pane tree; without one the
+        tab starts as a single pane, which is what most of them stay."""
+        if layout is None:
+            layout = {"cwd": cwd, "title": title}
+        root = Adw.Bin()
+        root.set_child(self._build_pane(layout))
+        page = self.tabview.append(root)
+        terms = pane_terminals(page)
+        if not terms:
+            return None
+        for term in terms:
+            term.page = page
+        # Until a pane takes focus the first one speaks for the tab.
+        page.smt_terminal = terms[0]
+        terms[0].refresh_title()
         if select:
             self.tabview.set_selected_page(page)
-            term.grab_focus()
-        return term
+            terms[0].grab_focus()
+        self.app.schedule_session_save()
+        return terms[0]
+
+    def _build_pane(self, node):
+        """One saved layout node back into widgets."""
+        children = node.get("children")
+        if children and len(children) == 2:
+            paned = Gtk.Paned(
+                orientation=(Gtk.Orientation.HORIZONTAL
+                             if node.get("split") == "h"
+                             else Gtk.Orientation.VERTICAL),
+                resize_start_child=True, resize_end_child=True,
+                shrink_start_child=False, shrink_end_child=False)
+            paned.set_start_child(self._build_pane(children[0]))
+            paned.set_end_child(self._build_pane(children[1]))
+            place_divider(paned, float(node.get("ratio") or 0.5))
+            return paned
+        term = Terminal(self.app, cwd=node.get("cwd") or None)
+        if node.get("title"):
+            term.custom_title = node["title"]
+        return wrap_terminal(term)
 
     def terminals(self):
+        """Every terminal in the window, panes included."""
         out = []
         for i in range(self.tabview.get_n_pages()):
-            term = getattr(self.tabview.get_nth_page(i), "smt_terminal", None)
-            if term:
-                out.append(term)
+            out.extend(pane_terminals(self.tabview.get_nth_page(i)))
         return out
+
+    def session_layout(self):
+        """The shape of the window: every tab's pane tree, and which of them
+        you were looking at. A tab whose layout cannot be read is dropped, so
+        the index counts what actually gets written rather than what is open."""
+        selected = self.tabview.get_selected_page()
+        tabs, index = [], 0
+        for i in range(self.tabview.get_n_pages()):
+            page = self.tabview.get_nth_page(i)
+            layout = layout_of(page)
+            if layout is None:
+                continue
+            if page is selected:
+                index = len(tabs)
+            tabs.append({"layout": layout})
+        return tabs, index
 
     def current_terminal(self):
         page = self.tabview.get_selected_page()
@@ -497,7 +879,10 @@ class Window(Adw.ApplicationWindow):
 
     def close_terminal(self, term):
         # Only reached when the shell itself exited, so there is nothing left
-        # to ask about.
+        # to ask about. In a split tab that is one pane going away, not the
+        # tab: the other panes are still running.
+        if self.close_pane(term):
+            return
         term.force_close = True
         if term.page:
             self.tabview.close_page(term.page)
@@ -522,12 +907,16 @@ class Window(Adw.ApplicationWindow):
         dialog.present(self)
 
     def _on_close_page(self, tabview, page):
-        term = getattr(page, "smt_terminal", None)
+        terms = pane_terminals(page)
+        term = getattr(page, "smt_terminal", None) or (terms[0] if terms else None)
         mode = self.app.config["confirm_close"]
-        busy = term.busy() if term else None
+        # Closing a split tab closes every pane in it, so any busy pane is
+        # reason enough to ask — and it is the one worth naming.
+        busy_term, busy = next(
+            ((t, state) for t in terms if (state := t.busy())), (term, None))
         ask = (
             term is not None
-            and not term.force_close
+            and not any(t.force_close for t in terms)
             and mode != "never"
             and (mode == "always" or busy is not None)
         )
@@ -538,11 +927,13 @@ class Window(Adw.ApplicationWindow):
         # AdwTabView lets the close run asynchronously: the page sits in a
         # closing state until close_page_finish, which is what makes a dialog
         # here possible at all.
-        name = term.display_title()
+        name = busy_term.display_title()
         if busy:
             kind, cmd = busy
             body = (f"“{name}” {self.BUSY_PHRASE[kind].format(cmd=cmd)}. "
                     "Closing the tab kills it.")
+        elif len(terms) > 1:
+            body = f"Close “{name}” and its {len(terms)} panes?"
         else:
             body = f"Close “{name}”?"
         self._confirm("Close Tab?", body, "Close Tab",
@@ -569,6 +960,10 @@ class Window(Adw.ApplicationWindow):
             term.set_attention(False)
             term.grab_focus()
             term.refresh_title()
+        self.app.schedule_session_save()
+
+    def _on_page_reordered(self, *_):
+        self.app.schedule_session_save()
 
     def _on_setup_menu(self, _tv, page):
         self._menu_page = page
@@ -896,18 +1291,35 @@ class App(Adw.Application):
 
     # ---- session ---------------------------------------------------------
     def _restore_session(self):
-        tabs = []
+        saved = {}
         if self.config["restore_session"]:
-            tabs = load_json(SESSION_PATH, {}).get("tabs", [])
+            saved = load_json(SESSION_PATH, {})
+        tabs = saved.get("tabs", [])
         for tab in tabs:
-            cwd = tab.get("cwd")
-            if cwd and os.path.isdir(cwd):
-                self.window.add_tab(cwd=cwd, title=tab.get("title"), select=False)
-        if self.window.tabview.get_n_pages() == 0:
+            # An unmounted volume or a deleted project must not silently cost
+            # you the tab — and dropping it here would also erase it from the
+            # session on the next save. Terminal._spawn already falls back to
+            # home for a directory it cannot enter, and the name survives.
+            #
+            # Sessions written before splits existed stored one directory per
+            # tab; that is simply a pane tree of one leaf.
+            layout = tab.get("layout") or {"cwd": tab.get("cwd"),
+                                           "title": tab.get("title")}
+            self.window.add_tab(layout=layout, select=False)
+        tabview = self.window.tabview
+        if tabview.get_n_pages() == 0:
             self.window.add_tab()
-        else:
-            first = self.window.tabview.get_nth_page(0)
-            self.window.tabview.set_selected_page(first)
+            return
+        # A session from before this was recorded, or one hand-edited into
+        # nonsense, comes back on the first tab rather than not at all.
+        index = saved.get("selected", 0)
+        if not isinstance(index, int) or not 0 <= index < tabview.get_n_pages():
+            index = 0
+        page = tabview.get_nth_page(index)
+        tabview.set_selected_page(page)
+        term = getattr(page, "smt_terminal", None)
+        if term:
+            focus_soon(term)
 
     def schedule_session_save(self):
         # cwd changes on every prompt; debounce so we aren't writing constantly.
@@ -923,11 +1335,15 @@ class App(Adw.Application):
     def save_session(self):
         if not self.window:
             return
-        tabs = [
-            {"cwd": t.cwd, "title": t.custom_title}
-            for t in self.window.terminals()
-        ]
-        save_json(SESSION_PATH, {"tabs": tabs})
+        tabs, selected = self.window.session_layout()
+        if not tabs:
+            # Having no tabs at all means the window is coming apart — a
+            # logout, a SIGHUP, the shells killed out from under it — not you
+            # closing them one by one. Writing the empty list would erase the
+            # session those tabs came from, so leave the last good one alone.
+            debug("not saving an empty session")
+            return
+        save_json(SESSION_PATH, {"tabs": tabs, "selected": selected})
 
     # ---- notifications ---------------------------------------------------
     def _sweep_stale_sockets(self):
