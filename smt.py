@@ -97,6 +97,19 @@ def dot_icon(color):
     return Gio.BytesIcon.new(GLib.Bytes.new(svg))
 
 
+def option_path(value):
+    """A --working-directory value as a plain str.
+
+    GOptionArg.FILENAME arrives as a NUL-terminated byte array, which
+    GLib.Variant.unpack() hands back as a list of ints, not as a string.
+    """
+    if isinstance(value, list):
+        value = bytes(value)
+    if isinstance(value, bytes):
+        value = os.fsdecode(value)
+    return value.rstrip("\x00") if value else value
+
+
 def load_json(path, fallback):
     try:
         with open(path) as fh:
@@ -825,10 +838,11 @@ class App(Adw.Application):
     # ---- lifecycle -------------------------------------------------------
     def do_command_line(self, command_line):
         opts = command_line.get_options_dict().end().unpack()
+        cwd = option_path(opts.get("working-directory"))
+        cwd = os.path.abspath(cwd) if cwd else None
         self.activate()
-        cwd = opts.get("working-directory")
         if cwd:
-            self.window.add_tab(cwd=os.path.abspath(cwd))
+            self.window.add_tab(cwd=cwd)
         return 0
 
     def do_activate(self):
