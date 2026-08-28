@@ -27,6 +27,7 @@ mkdir -p "$BIN" "$SHARE" "$DESKTOP"
 install -m 755 "$SRC/smt.py"     "$BIN/smt"
 install -m 755 "$SRC/smt-notify" "$BIN/smt-notify"
 install -m 644 "$SRC/shell-integration.bash" "$SHARE/shell-integration.bash"
+install -m 644 "$SRC/shell-integration.zsh"  "$SHARE/shell-integration.zsh"
 
 echo "==> installing desktop entry"
 # The desktop file must be named after the app id, otherwise Wayland shows a
@@ -45,12 +46,18 @@ StartupWMClass=$APP_ID
 DESK
 update-desktop-database "$DESKTOP" 2>/dev/null || true
 
-echo "==> wiring shell integration into ~/.bashrc"
-LINE="[ -f \"$SHARE/shell-integration.bash\" ] && . \"$SHARE/shell-integration.bash\""
-if grep -qF "shell-integration.bash" "$HOME/.bashrc" 2>/dev/null; then
+# Wire the integration for the login shell, not for whatever runs this script:
+# a user whose shell is zsh would otherwise get a ~/.bashrc that is never read.
+case "$(basename "${SHELL:-/bin/bash}")" in
+  zsh) RC="$HOME/.zshrc";  INTEGRATION="$SHARE/shell-integration.zsh" ;;
+  *)   RC="$HOME/.bashrc"; INTEGRATION="$SHARE/shell-integration.bash" ;;
+esac
+echo "==> wiring shell integration into $RC"
+LINE="[ -f \"$INTEGRATION\" ] && . \"$INTEGRATION\""
+if grep -qF "$INTEGRATION" "$RC" 2>/dev/null; then
   echo "    already present, skipping"
 else
-  printf '\n# simple-multi-terminal\n%s\n' "$LINE" >> "$HOME/.bashrc"
+  printf '\n# simple-multi-terminal\n%s\n' "$LINE" >> "$RC"
   echo "    appended"
 fi
 
@@ -100,6 +107,6 @@ echo
 echo "Done. Launch with:  smt"
 case ":$PATH:" in
   *":$BIN:"*) ;;
-  *) echo "NOTE: $BIN is not on your PATH; add it to ~/.bashrc" ;;
+  *) echo "NOTE: $BIN is not on your PATH; add it to $RC" ;;
 esac
-echo "Open a NEW tab (or 'source ~/.bashrc') for shell integration to take effect."
+echo "Open a NEW tab (or 'source $RC') for shell integration to take effect."

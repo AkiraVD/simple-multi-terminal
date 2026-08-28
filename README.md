@@ -25,7 +25,8 @@ sudo apt install gir1.2-vte-3.91 gir1.2-gtk-4.0 gir1.2-adw-1 python3-gi
 ```
 
 `install.sh` is idempotent. It installs `smt` and `smt-notify` into
-`~/.local/bin`, adds a desktop entry, appends one line to `~/.bashrc`, and
+`~/.local/bin`, adds a desktop entry, appends one line to the rc file of your
+login shell (`~/.zshrc` or `~/.bashrc`), and
 adds three hooks to `~/.claude/settings.json` (backing up the existing file
 first). Then:
 
@@ -83,9 +84,11 @@ so there is no guessing and no false positives.
 
 ### Long-running commands
 
-`shell-integration.bash` uses a `DEBUG` trap to time each command. When one
-finishes that ran longer than `notify_min_seconds` (default 10), you get a
-notification with the command, its exit code, and how long it took.
+`shell-integration.bash` uses a `DEBUG` trap to time each command, and
+`shell-integration.zsh` does the same job with zsh's own `preexec`/`precmd`
+hooks. When a command finishes that ran longer than `notify_min_seconds`
+(default 10), you get a notification with the command, its exit code, and how
+long it took. `install.sh` wires whichever one matches your login shell.
 
 Cost on a normal prompt is a few shell builtins and one `printf`. The helper
 process only ever spawns *after* a command that already ran 10+ seconds, so its
