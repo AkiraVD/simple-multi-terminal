@@ -18,10 +18,7 @@ gi.require_version("Vte", "3.91")
 from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
 
 import json  # noqa: E402
-import shutil  # noqa: E402
 import signal  # noqa: E402
-import socket  # noqa: E402
-import subprocess  # noqa: E402
 import sys  # noqa: E402
 import uuid  # noqa: E402
 from urllib.parse import unquote, urlparse  # noqa: E402
@@ -32,9 +29,6 @@ CONFIG_DIR = os.path.join(GLib.get_user_config_dir(), "simple-multi-terminal")
 DATA_DIR = os.path.join(GLib.get_user_data_dir(), "simple-multi-terminal")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config.json")
 SESSION_PATH = os.path.join(DATA_DIR, "session.json")
-# One fixed path rather than one per pid: a second launch has to be able to
-# find the first one without knowing its pid.
-SOCKET_PATH = os.path.join(GLib.get_user_runtime_dir(), "smt.sock")
 
 DEFAULT_CONFIG = {
     "font": "Monospace 11",
@@ -73,95 +67,12 @@ PALETTE = [
 FG, BG = "#d8d8d8", "#1b1d1e"
 
 
-# ---- platform ------------------------------------------------------------
-# Three questions need the process table: what is this pid, what else is alive
-# in this tab, and is that pid still around. Linux answers them by reading
-# /proc. macOS has no /proc, so the same answers come from ps(1) and kill(2).
-IS_LINUX = sys.platform.startswith("linux")
-IS_MAC = sys.platform == "darwin"
-
-
-def _capture(argv):
-    """Stdout of a short-lived command, or "" if it failed. Never raises."""
-    try:
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=2)
-    except (OSError, subprocess.SubprocessError):
-        return ""
-    return done.stdout if done.returncode == 0 else ""
-
-
-def _spawn_detached(argv):
-    """Fire and forget. Notifiers must never block or outlive their usefulness."""
-    try:
-        subprocess.Popen(argv, stdout=subprocess.DEVNULL,
-                         stderr=subprocess.DEVNULL, start_new_session=True)
-    except OSError as exc:
-        debug("could not run", argv[0], exc)
-
-
-TERMINAL_NOTIFIER = shutil.which("terminal-notifier") if IS_MAC else None
-
-
-def _applescript_string(text):
-    """An AppleScript string literal; only backslash and quote need escaping."""
-    return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
-
-
 def _comm(pid):
-    """The command name behind a pid, for "npm run build is still running"."""
-    if IS_LINUX:
-        try:
-            with open(f"/proc/{pid}/comm") as fh:
-                return fh.read().strip() or "a command"
-        except OSError:
-            return "a command"
-    name = _capture(["ps", "-o", "comm=", "-p", str(pid)]).strip()
-    return os.path.basename(name) if name else "a command"
-
-
-def _linux_session_processes(leader):
-    found = []
-    for name in os.listdir("/proc"):
-        if not name.isdigit() or int(name) == leader:
-            continue
-        try:
-            with open(f"/proc/{name}/stat") as fh:
-                line = fh.read()
-            # comm sits in parens and may itself contain spaces or parens,
-            # so split around the last ')' rather than on whitespace.
-            head = line.rindex(")")
-            comm = line[line.index("(") + 1:head]
-            fields = line[head + 2:].split()
-            state, session = fields[0], int(fields[3])
-        except (OSError, ValueError, IndexError):
-            continue
-        if session == leader:
-            found.append((int(name), comm, state))
-    return found
-
-
-def _bsd_session_processes(leader):
-    """The macOS equivalent, grouped by controlling terminal rather than by
-    session id: BSD ps cannot report a session id (its `sess` keyword prints a
-    kernel pointer), but VTE hands every tab its own pty, so "attached to this
-    tab's tty" picks out exactly the same processes."""
-    tty = _capture(["ps", "-o", "tty=", "-p", str(leader)]).strip()
-    if not tty or "?" in tty:
-        return []
-    found = []
-    for line in _capture(["ps", "-t", tty, "-o", "pid=,stat=,comm="]).splitlines():
-        fields = line.split(None, 2)
-        if len(fields) < 3:
-            continue
-        try:
-            pid = int(fields[0])
-        except ValueError:
-            continue
-        if pid == leader:
-            continue
-        # BSD state is a letter plus flags ("S+", "Ss", "T"); we want the letter.
-        found.append((pid, os.path.basename(fields[2]), fields[1][:1]))
-    return found
+    try:
+        with open(f"/proc/{pid}/comm") as fh:
+            return fh.read().strip() or "a command"
+    except OSError:
+        return "a command"
 
 
 def monospace_only(item):
@@ -237,25 +148,6 @@ def hexcolor(c):
     return "#%02x%02x%02x" % (round(c.red * 255), round(c.green * 255), round(c.blue * 255))
 
 
-# The Mac line-editing keys, mapped to the sequences readline and zle already
-# bind. VTE does not translate these itself — Terminal.app and iTerm2 do, which
-# is why Cmd+Delete erases a single character in a stock GTK/VTE terminal and
-# Option+Left does nothing. GTK's macOS backend reports Command as META and
-# Option as ALT.
-MAC_CMD_KEYS = {
-    Gdk.KEY_BackSpace: b"\x15",      # kill to start of line
-    Gdk.KEY_Delete:    b"\x0b",      # kill to end of line
-    Gdk.KEY_Left:      b"\x01",      # start of line
-    Gdk.KEY_Right:     b"\x05",      # end of line
-}
-MAC_ALT_KEYS = {
-    Gdk.KEY_BackSpace: b"\x1b\x7f",  # kill the word behind the cursor
-    Gdk.KEY_Delete:    b"\x1bd",     # kill the word ahead of it
-    Gdk.KEY_Left:      b"\x1bb",      # back one word
-    Gdk.KEY_Right:     b"\x1bf",      # forward one word
-}
-
-
 class Terminal(Vte.Terminal):
     """One tab's terminal. Owns its shell, its id, and its cwd tracking."""
 
@@ -289,15 +181,6 @@ class Terminal(Vte.Terminal):
         focus.connect("enter", self._on_focus_enter)
         self.add_controller(focus)
 
-        if IS_MAC:
-            # Capture phase: VTE claims most key presses in its own handler, so
-            # a bubbling controller would never see them. Only the eight keys
-            # in the tables above are taken; everything else falls through
-            # untouched, Option+letter included, which still composes.
-            keys = Gtk.EventControllerKey()
-            keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
-            keys.connect("key-pressed", self._on_mac_editing_key)
-            self.add_controller(keys)
         self._spawn()
 
     # ---- settings --------------------------------------------------------
@@ -333,20 +216,6 @@ class Terminal(Vte.Terminal):
         })
         return [f"{k}={v}" for k, v in env.items()]
 
-    def _on_mac_editing_key(self, _controller, keyval, _keycode, state):
-        cmd = bool(state & Gdk.ModifierType.META_MASK)
-        alt = bool(state & Gdk.ModifierType.ALT_MASK)
-        # Exactly one of Cmd/Option, and nothing else held: Ctrl+key belongs to
-        # the shell, and Shift+key to whatever selection the user is making.
-        if cmd == alt or state & (Gdk.ModifierType.CONTROL_MASK
-                                  | Gdk.ModifierType.SHIFT_MASK):
-            return False
-        sequence = (MAC_CMD_KEYS if cmd else MAC_ALT_KEYS).get(keyval)
-        if sequence is None:
-            return False
-        self.feed_child(sequence)
-        return True
-
     def _spawn(self):
         shell = self.app.config["shell"] or os.environ.get("SHELL") or "/bin/bash"
         cwd = self.cwd if os.path.isdir(self.cwd) else os.path.expanduser("~")
@@ -376,9 +245,24 @@ class Terminal(Vte.Terminal):
         """
         if self.child_pid is None:
             return []
-        if IS_LINUX:
-            return _linux_session_processes(self.child_pid)
-        return _bsd_session_processes(self.child_pid)
+        found = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit() or int(name) == self.child_pid:
+                continue
+            try:
+                with open(f"/proc/{name}/stat") as fh:
+                    line = fh.read()
+                # comm sits in parens and may itself contain spaces or parens,
+                # so split around the last ')' rather than on whitespace.
+                head = line.rindex(")")
+                comm = line[line.index("(") + 1:head]
+                fields = line[head + 2:].split()
+                state, session = fields[0], int(fields[3])
+            except (OSError, ValueError, IndexError):
+                continue
+            if session == self.child_pid:
+                found.append((int(name), comm, state))
+        return found
 
     def busy(self):
         """What is running in this tab, as (kind, command), or None if idle.
@@ -486,7 +370,7 @@ class Terminal(Vte.Terminal):
         if pending and not on:
             # Drop the desktop notification still sitting in the shell's tray;
             # you have looked at the tab, so it has done its job.
-            self.app.desktop_withdraw(f"smt-{self.tab_id}")
+            self.app.withdraw_notification(f"smt-{self.tab_id}")
 
     def _on_bell(self, _t):
         if self.app.config["notify_on_bell"]:
@@ -618,31 +502,6 @@ def focus_soon(term):
     GLib.timeout_add(30, go)
 
 
-# Command-key equivalents, added alongside the Ctrl bindings on macOS. GDK maps
-# the Mac Command key to <Meta>, and unlike Ctrl it collides with nothing the
-# shell wants: Ctrl+C in a tab has to stay Ctrl+C.
-MAC_ACCELS = {
-    "new-tab":     ["<Meta>t"],
-    "close-tab":   ["<Meta>w"],
-    "rename-tab":  ["<Meta><Shift>r"],
-    "preferences": ["<Meta>comma"],
-    "copy":        ["<Meta>c"],
-    "paste":       ["<Meta>v"],
-    "next-tab":    ["<Meta><Shift>bracketright"],
-    "prev-tab":    ["<Meta><Shift>bracketleft"],
-    "zoom-in":     ["<Meta>plus", "<Meta>equal"],
-    "zoom-out":    ["<Meta>minus"],
-    "zoom-reset":  ["<Meta>0"],
-    "split-right": ["<Meta>d"],
-    "split-down":  ["<Meta><Shift>d"],
-    "close-pane":  ["<Meta><Shift>w"],
-    "focus-left":  ["<Meta><Alt>Left"],
-    "focus-right": ["<Meta><Alt>Right"],
-    "focus-up":    ["<Meta><Alt>Up"],
-    "focus-down":  ["<Meta><Alt>Down"],
-}
-
-
 class Window(Adw.ApplicationWindow):
     def __init__(self, app):
         super().__init__(application=app, title=APP_NAME)
@@ -660,13 +519,10 @@ class Window(Adw.ApplicationWindow):
 
         tabbar = Adw.TabBar(view=self.tabview, autohide=False, expand_tabs=False)
 
-        new_btn = Gtk.Button(
-            icon_name="tab-new-symbolic",
-            tooltip_text=f"New Tab ({'Cmd+T' if IS_MAC else 'Ctrl+Shift+T'})")
+        new_btn = Gtk.Button(icon_name="tab-new-symbolic", tooltip_text="New Tab (Ctrl+Shift+T)")
         new_btn.set_action_name("win.new-tab")
-        prefs_btn = Gtk.Button(
-            icon_name="emblem-system-symbolic",
-            tooltip_text=f"Preferences ({'Cmd+,' if IS_MAC else 'Ctrl+,'})")
+        prefs_btn = Gtk.Button(icon_name="emblem-system-symbolic",
+                               tooltip_text="Preferences (Ctrl+,)")
         prefs_btn.set_action_name("win.preferences")
         header = Adw.HeaderBar()
         header.pack_start(new_btn)
@@ -706,14 +562,6 @@ class Window(Adw.ApplicationWindow):
             ("focus-down",  self.action_focus_down,  ["<Alt>Down"]),
         ]
         for name, cb, accels in specs:
-            if IS_MAC:
-                # Option+arrow is a line-editing key inside the tab (see
-                # MAC_ALT_KEYS), so on macOS the Alt bindings are replaced
-                # rather than added to — an accelerator would win first and
-                # the shell would never see the key.
-                accels = MAC_ACCELS.get(name, []) + [
-                    a for a in accels if "<Alt>" not in a
-                ]
             act = Gio.SimpleAction.new(name, None)
             act.connect("activate", cb)
             self.add_action(act)
@@ -724,10 +572,7 @@ class Window(Adw.ApplicationWindow):
         goto.connect("activate", self.action_goto_tab)
         self.add_action(goto)
         for i in range(1, 10):
-            # Alt+digit types an accented character on a Mac keyboard, so there
-            # the jump lives on Cmd+digit, which is what Terminal.app uses too.
-            accel = f"<Meta>{i}" if IS_MAC else f"<Alt>{i}"
-            self.app.set_accels_for_action(f"win.goto-tab({i})", [accel])
+            self.app.set_accels_for_action(f"win.goto-tab({i})", [f"<Alt>{i}"])
 
     def action_new_tab(self, *_):
         cur = self.current_terminal()
@@ -1350,12 +1195,7 @@ class App(Adw.Application):
         self.config = {**DEFAULT_CONFIG, **load_json(CONFIG_PATH, {})}
         self.attention_icon = dot_icon(self.config["attention_color"])
         self.window = None
-        # macOS needs one fixed path, because that is how a second launch
-        # finds the first without a D-Bus bus to ask. Linux keeps one socket
-        # per pid: GApplication's own uniqueness already stops a second
-        # instance there, and a shared path would instead let two instances on
-        # separate session buses unlink each other's socket.
-        self.socket_path = SOCKET_PATH if IS_MAC else os.path.join(
+        self.socket_path = os.path.join(
             GLib.get_user_runtime_dir(), f"smt-{os.getpid()}.sock"
         )
         self._service = None
@@ -1370,38 +1210,10 @@ class App(Adw.Application):
         opts = command_line.get_options_dict().end().unpack()
         cwd = option_path(opts.get("working-directory"))
         cwd = os.path.abspath(cwd) if cwd else None
-        if IS_MAC and self.window is None and self._forward_to_running_instance(cwd):
-            return 0
         self.activate()
         if cwd:
             self.window.add_tab(cwd=cwd)
         return 0
-
-    def _forward_to_running_instance(self, cwd):
-        """Hand this launch to an instance that is already up, and report
-        whether it was taken.
-
-        GApplication's own uniqueness rides on a D-Bus session bus, which macOS
-        does not have, so without this every launch becomes a second window —
-        and two windows restoring and then saving the same session.json means
-        whichever quits last silently discards the other one's tabs. The
-        notification socket is already listening, so it does the introduction.
-        A refused connection means the socket outlived the process that made
-        it, and this launch is the real instance.
-        """
-        try:
-            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
-                sock.settimeout(2.0)
-                sock.connect(SOCKET_PATH)
-                sock.sendall((json.dumps({"kind": "open", "cwd": cwd}) + "\n").encode())
-                reply = sock.recv(16)
-        except OSError as exc:
-            debug("no instance to hand this launch to", exc)
-            return False
-        taken = reply.startswith(b"ok")
-        debug("handed this launch to the running instance" if taken
-              else "running instance refused this launch")
-        return taken
 
     def do_activate(self):
         if self.window:
@@ -1424,15 +1236,10 @@ class App(Adw.Application):
         return GLib.SOURCE_REMOVE
 
     def _cleanup_socket(self):
-        # Only the instance that bound the socket may remove it. A launch that
-        # handed itself over to a running instance shuts down through here too,
-        # and deleting the path on the way out would leave the survivor
-        # unreachable to every launch after it.
-        if not self._service:
-            return
-        self._service.stop()
-        self._service.close()
-        self._service = None
+        if self._service:
+            self._service.stop()
+            self._service.close()
+            self._service = None
         try:
             os.unlink(self.socket_path)
         except OSError:
@@ -1515,12 +1322,7 @@ class App(Adw.Application):
 
     # ---- notifications ---------------------------------------------------
     def _sweep_stale_sockets(self):
-        """Remove sockets from instances that were killed instead of closed.
-
-        Only Linux needs this: its socket carries a pid, so a crash leaves a
-        file nobody will ever bind again. macOS reuses one fixed path, which
-        _start_socket takes over on its own.
-        """
+        """Remove sockets from instances that were killed instead of closed."""
         runtime = GLib.get_user_runtime_dir()
         try:
             names = os.listdir(runtime)
@@ -1544,10 +1346,7 @@ class App(Adw.Application):
                 pass
 
     def _start_socket(self):
-        if not IS_MAC:
-            self._sweep_stale_sockets()
-        # Safe to take the path over: we only get here once nobody answered on
-        # it, so anything still sitting there is a leftover from a crash.
+        self._sweep_stale_sockets()
         try:
             os.unlink(self.socket_path)
         except OSError:
@@ -1561,7 +1360,6 @@ class App(Adw.Application):
             )
         except GLib.Error as exc:
             print(f"smt: notification socket unavailable: {exc.message}", file=sys.stderr)
-            self._service = None    # nothing bound, so nothing to clean up
             return
         self._service.connect("incoming", self._on_socket_incoming)
         self._service.start()
@@ -1578,14 +1376,9 @@ class App(Adw.Application):
             line = None
         if line:
             try:
-                reply = self._handle_message(json.loads(bytes(line).decode()))
+                self._handle_message(json.loads(bytes(line).decode()))
             except (ValueError, UnicodeDecodeError):
-                reply = None
-            if reply:
-                try:
-                    connection.get_output_stream().write_all(reply, None)
-                except GLib.Error:
-                    pass
+                pass
         try:
             connection.close(None)
         except GLib.Error:
@@ -1600,24 +1393,12 @@ class App(Adw.Application):
         return None
 
     def _handle_message(self, msg):
-        """Act on one socket message, returning a reply for the kinds that
-        need one. Only "open" does: the sender has to know whether to exit or
-        to carry on becoming the instance itself."""
         debug("recv", msg)
-        kind = msg.get("kind")
-
-        if kind == "open":
-            if not self.window:
-                return None     # still starting up; let the caller be its own
-            if msg.get("cwd"):
-                self.window.add_tab(cwd=msg["cwd"])
-            self.window.present()
-            return b"ok\n"
-
         term = self._find_terminal(msg.get("tab_id", ""))
         if not term:
             debug("no terminal for tab_id", msg.get("tab_id"))
-            return None
+            return
+        kind = msg.get("kind")
 
         if kind == "command-done":
             if not self.config["notify_on_command_done"]:
@@ -1652,34 +1433,10 @@ class App(Adw.Application):
             return
         term.set_attention(True, f"{title} — {body}")
 
-        self.desktop_notify(f"smt-{term.tab_id}", title,
-                            f"{term.display_title()} — {body}")
-
-    # GNotification is the right tool on Linux, where the shell owns the tray
-    # and withdrawing works. On macOS it has no usable backend — its Cocoa path
-    # wants an app bundle — so notifications go out through a helper instead:
-    # terminal-notifier when installed, because it alone can pull a
-    # notification back, and otherwise osascript, which every Mac already has.
-    def desktop_notify(self, ident, title, body):
-        if not IS_MAC:
-            notification = Gio.Notification.new(title)
-            notification.set_body(body)
-            notification.set_priority(Gio.NotificationPriority.NORMAL)
-            self.send_notification(ident, notification)
-        elif TERMINAL_NOTIFIER:
-            _spawn_detached([TERMINAL_NOTIFIER, "-title", title,
-                             "-message", body, "-group", ident])
-        else:
-            _spawn_detached(["osascript", "-e", "display notification "
-                             f"{_applescript_string(body)} with title "
-                             f"{_applescript_string(title)}"])
-
-    def desktop_withdraw(self, ident):
-        if not IS_MAC:
-            self.withdraw_notification(ident)
-        elif TERMINAL_NOTIFIER:
-            _spawn_detached([TERMINAL_NOTIFIER, "-remove", ident])
-        # Plain osascript notifications cannot be recalled; they age out.
+        notification = Gio.Notification.new(title)
+        notification.set_body(f"{term.display_title()} — {body}")
+        notification.set_priority(Gio.NotificationPriority.NORMAL)
+        self.send_notification(f"smt-{term.tab_id}", notification)
 
 
 def main():
