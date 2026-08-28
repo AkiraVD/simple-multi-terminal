@@ -8,9 +8,24 @@
 # Cost on a normal prompt is two shell builtins and one printf. The helper
 # process only ever spawns after a command that already ran for 10+ seconds,
 # so the overhead is irrelevant by construction.
+#
+# Timing wants a clock finer than the threshold it feeds. $SECONDS is
+# truncated at both ends, so a command that really ran 10.0s can measure 9 and
+# never report; $EPOCHREALTIME counts microseconds and does not. It arrived in
+# bash 5 though, and macOS still ships 3.2 as /bin/bash, so pick once at
+# startup rather than testing on every prompt.
 
 [[ -n "$SMT_TAB_ID" ]] || return 0
 [[ $- == *i* ]] || return 0
+
+if [[ -n "$EPOCHREALTIME" ]]; then
+  # The decimal separator follows LC_NUMERIC and is a comma in some locales,
+  # so drop whatever is not a digit instead of assuming a dot. The fraction is
+  # always six digits, which makes what is left a microsecond count.
+  __smt_now() { __SMT_NOW=${EPOCHREALTIME//[!0-9]/}; }
+else
+  __smt_now() { __SMT_NOW=$(( SECONDS * 1000000 )); }
+fi
 
 __smt_urlencode() {
   local s="$1" out="" c
@@ -36,7 +51,7 @@ __smt_preexec() {
   [[ -n "$__SMT_RUNNING" ]] && return             # only the first command of a line
   [[ "$BASH_COMMAND" == "__smt_precmd"* ]] && return
   __SMT_RUNNING=1
-  __SMT_T0=${EPOCHREALTIME/./}
+  __smt_now; __SMT_T0=$__SMT_NOW
   __SMT_CMD=$BASH_COMMAND
 }
 
@@ -44,7 +59,8 @@ __smt_precmd() {
   local code=$?
   __smt_osc7
   if [[ -n "$__SMT_RUNNING" ]]; then
-    local elapsed=$(( (${EPOCHREALTIME/./} - __SMT_T0) / 1000000 ))
+    __smt_now
+    local elapsed=$(( (__SMT_NOW - __SMT_T0) / 1000000 ))
     unset __SMT_RUNNING
     if (( elapsed >= ${SMT_NOTIFY_MIN_SECONDS:-10} )); then
       smt-notify command-done --exit "$code" --seconds "$elapsed" \

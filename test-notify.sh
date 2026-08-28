@@ -11,7 +11,8 @@
 secs=${1:-15}
 code=${2:-0}
 
-# The trap lives in the parent interactive shell, so a subshell cannot see it.
+# The timing hook lives in the parent interactive shell (a DEBUG trap under
+# bash, preexec/precmd under zsh), so a subshell cannot see it.
 # All we can check here is that the terminal exported its socket into the tab.
 if [[ -z "$SMT_TAB_ID" || -z "$SMT_SOCKET" ]]; then
   echo "not inside SMT (SMT_TAB_ID/SMT_SOCKET unset) - nothing will notify" >&2
