@@ -25,6 +25,19 @@ Nothing has been tagged yet, so everything below is unreleased. Newest first.
 
 ### Added
 
+- **macOS support, and a standalone app bundle.** Re-applies the work that was
+  merged in #4 and reverted in #5, unchanged apart from being rebased past the
+  split-pane and prompt-garbling fixes. Every platform-specific path sits
+  behind `IS_MAC`: Command-key accelerators and the eight line-editing keys VTE
+  does not translate, process inspection through `ps(1)` where there is no
+  `/proc`, notifications via terminal-notifier or osascript because
+  GNotification has no usable Cocoa backend, and single-instance hand-off over
+  the notification socket because macOS has no D-Bus session bus for
+  GApplication to use. `make-app.sh` builds `~/Applications/SMT.app`. Linux
+  keeps GNotification, the `.desktop` entry, the Ctrl+Shift bindings, its
+  per-pid socket and its `env python3` shebang; verified by running the app
+  under Xvfb, splits, tabs, `/proc` inspection and notifications included.
+
 - **Split panes.** A tab holds a tree rather than one terminal: a `Gtk.Paned`
   per split, a terminal at each leaf, nesting in either direction. Moving
   between panes picks the nearest one geometrically, closing a pane hangs its
