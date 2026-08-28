@@ -44,9 +44,11 @@ install -m 755 "$SRC/smt.py"     "$BIN/smt"
 install -m 755 "$SRC/smt-notify" "$BIN/smt-notify"
 install -m 644 "$SRC/shell-integration.bash" "$SHARE/shell-integration.bash"
 install -m 644 "$SRC/shell-integration.zsh"  "$SHARE/shell-integration.zsh"
-# Pin the shebang to the interpreter that actually has the bindings; `env
-# python3` would pick whichever python comes first on PATH at launch time.
-"$PY" - "$BIN/smt" "$PY" <<'PY'
+# Pin the shebang to the interpreter that actually has the bindings; on macOS
+# `env python3` would pick the system python over Homebrew's. Linux keeps the
+# `env python3` it shipped with, which survives the interpreter moving.
+if [ "$OS" = "Darwin" ]; then
+  "$PY" - "$BIN/smt" "$PY" <<'PY'
 import sys
 path, interpreter = sys.argv[1], sys.argv[2]
 with open(path) as fh:
@@ -55,6 +57,7 @@ lines[0] = f"#!{interpreter}\n"
 with open(path, "w") as fh:
     fh.writelines(lines)
 PY
+fi
 
 if [ "$OS" = "Darwin" ]; then
   echo "==> building the app bundle"

@@ -1350,7 +1350,14 @@ class App(Adw.Application):
         self.config = {**DEFAULT_CONFIG, **load_json(CONFIG_PATH, {})}
         self.attention_icon = dot_icon(self.config["attention_color"])
         self.window = None
-        self.socket_path = SOCKET_PATH
+        # macOS needs one fixed path, because that is how a second launch
+        # finds the first without a D-Bus bus to ask. Linux keeps one socket
+        # per pid: GApplication's own uniqueness already stops a second
+        # instance there, and a shared path would instead let two instances on
+        # separate session buses unlink each other's socket.
+        self.socket_path = SOCKET_PATH if IS_MAC else os.path.join(
+            GLib.get_user_runtime_dir(), f"smt-{os.getpid()}.sock"
+        )
         self._service = None
         self._save_source = 0
         self.add_main_option(
@@ -1363,7 +1370,7 @@ class App(Adw.Application):
         opts = command_line.get_options_dict().end().unpack()
         cwd = option_path(opts.get("working-directory"))
         cwd = os.path.abspath(cwd) if cwd else None
-        if self.window is None and self._forward_to_running_instance(cwd):
+        if IS_MAC and self.window is None and self._forward_to_running_instance(cwd):
             return 0
         self.activate()
         if cwd:
@@ -1507,7 +1514,38 @@ class App(Adw.Application):
         save_json(SESSION_PATH, {"tabs": tabs, "selected": selected})
 
     # ---- notifications ---------------------------------------------------
+    def _sweep_stale_sockets(self):
+        """Remove sockets from instances that were killed instead of closed.
+
+        Only Linux needs this: its socket carries a pid, so a crash leaves a
+        file nobody will ever bind again. macOS reuses one fixed path, which
+        _start_socket takes over on its own.
+        """
+        runtime = GLib.get_user_runtime_dir()
+        try:
+            names = os.listdir(runtime)
+        except OSError:
+            return
+        for name in names:
+            if not (name.startswith("smt-") and name.endswith(".sock")):
+                continue
+            try:
+                pid = int(name[4:-5])
+            except ValueError:
+                continue
+            if pid == os.getpid():
+                continue
+            if os.path.isdir(f"/proc/{pid}"):
+                continue  # still running
+            try:
+                os.unlink(os.path.join(runtime, name))
+                debug("swept stale socket", name)
+            except OSError:
+                pass
+
     def _start_socket(self):
+        if not IS_MAC:
+            self._sweep_stale_sockets()
         # Safe to take the path over: we only get here once nobody answered on
         # it, so anything still sitting there is a leftover from a crash.
         try:
