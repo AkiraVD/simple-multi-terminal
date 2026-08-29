@@ -1391,6 +1391,43 @@ class App(Adw.Application):
         )
 
     # ---- lifecycle -------------------------------------------------------
+    def do_startup(self):
+        Adw.Application.do_startup(self)
+        self._install_app_actions()
+
+    def _install_app_actions(self):
+        """Register the commands the macOS application menu points at.
+
+        GTK builds that menu itself on a Mac, and its About, Settings and Quit
+        items name app.about, app.preferences and app.quit. A menu item whose
+        action nobody registered is drawn greyed out, which is why the menu was
+        dead — Cmd+Q with it. The window already owns equivalents of these; the
+        menu bar needs them on the application, which outlives any one window.
+
+        Quitting goes through GApplication rather than straight to exit so that
+        do_shutdown still runs, which is what writes the session out.
+        """
+        for name, cb in (
+            ("about", self._on_about),
+            ("preferences", self._on_preferences),
+            ("quit", lambda *_: self.quit()),
+        ):
+            act = Gio.SimpleAction.new(name, None)
+            act.connect("activate", cb)
+            self.add_action(act)
+
+    def _on_preferences(self, *_):
+        if self.window:
+            self.window.action_preferences()
+
+    def _on_about(self, *_):
+        Adw.AboutDialog(
+            application_name=APP_NAME,
+            application_icon=APP_ID,
+            comments="Tabs, splits, renaming, notifications and persistent paths.",
+            website="https://github.com/AkiraVD/simple-multi-terminal",
+        ).present(self.window)
+
     def do_command_line(self, command_line):
         opts = command_line.get_options_dict().end().unpack()
         cwd = option_path(opts.get("working-directory"))
