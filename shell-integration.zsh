@@ -47,14 +47,31 @@ __smt_osc7() {
   printf '\033]7;file://%s%s\033\\' "${HOST:-${HOSTNAME:-localhost}}" "$path"
 }
 
+# OSC 6 - "a command is running", cleared at the next prompt. A printf rather
+# than a call to smt-notify because it fires on every command, and a helper
+# process per command is the cost this integration exists to avoid. The program
+# name rides along when it needs no encoding; otherwise the tab just says
+# something is running.
+__smt_busy() {
+  local prog=${1%% *}
+  [[ "$prog" =~ '^[-_.+A-Za-z0-9]+$' ]] || prog=""
+  printf '\033]6;file:///smt/busy/%s\033\\' "$prog"
+}
+
+__smt_idle() { printf '\033]6;\033\\' }
+
 __smt_preexec() {
   __smt_now; __SMT_T0=$__SMT_NOW
   __SMT_CMD=$1
+  # zsh's preexec only fires for commands you actually ran, so the guard the
+  # bash side needs against its own rc is unnecessary here.
+  __smt_busy "$1"
 }
 
 __smt_precmd() {
   local code=$?
   __smt_osc7
+  __smt_idle
   if (( __SMT_T0 )); then
     __smt_now
     local elapsed=$(( (__SMT_NOW - __SMT_T0) / 1000000 ))

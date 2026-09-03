@@ -79,6 +79,46 @@ still finds `terminal-notifier`.
 
 On Linux the desktop entry does the same job, and `make-app.sh` is not used.
 
+## Knowing what a tab is doing
+
+Every tab wears at most one dot, and its colour is the whole message:
+
+| | |
+|---|---|
+| **yellow** | something is running here, or Claude is writing an answer |
+| **green** | it finished, or it wants you |
+| **red** | a command that notified you exited non-zero |
+
+Working outranks finished, and a failure outranks both — once a pane starts
+something new, how the last command ended is history, and a failure you have
+not looked at is worth more than a success. The tooltip says which, and in a
+split tab the dot speaks for whichever pane has the most to say.
+
+The dot is deliberately not libadwaita's spinner. An animated spinner measured
+~5% of a core for as long as it turned — 13% with four tabs going — which a
+half-hour build would pay in full, for animation alone. A dot costs 0.0–0.2%,
+which is what an idle tab costs.
+
+Two sources feed the yellow one, and they disagree in the way that makes it
+useful:
+
+- **The shell** marks a command as running at `preexec` and clears it at the
+  next prompt. It is an `OSC 6` escape — one `printf`, no process. Measured
+  12 µs per command against the ~246 µs a forked helper costs, which is why it
+  is not a call to `smt-notify` like the other notifications.
+- **Claude Code's hooks** mark the finer state inside a `claude` session.
+  Without them the tab would spin for the entire session, since from the
+  shell's point of view `claude` is one long command. `UserPromptSubmit`
+  turns the dot yellow, and `Stop` or a permission prompt turns it green — so
+  the tab is yellow exactly while Claude is writing an answer.
+
+The tooltip names what is running (`Working: pytest`) when the program's name
+travels safely in a URI, and says `Working: a command` when it does not. The three colours are preferences, under *Tab dots*, where the
+yellow one can also be switched off on its own.
+
+Existing installs need `./install.sh` re-run for the Claude half — it adds the
+`UserPromptSubmit` hook — and a new shell for the command half.
+
 ## Keys
 
 |                       | macOS also            |                     |
@@ -345,8 +385,11 @@ written on first run.
 | `restore_session`        | `true`         |                                            |
 | `audible_bell`           | `false`        |                                            |
 | `cursor_blink`           | `true`         |                                            |
+| `show_activity`          | `true`         | show the yellow working dot at all          |
 | `login_shell`            | `false`        | `true` runs the shell with `-l`            |
-| `attention_color`        | `#f6d32d`      | the dot on tabs with a pending notification |
+| `color_working`          | `#f6d32d`      | the dot while something is running          |
+| `color_done`             | `#2ec27e`      | the dot when it finished, or wants you      |
+| `color_error`            | `#e01b24`      | the dot when a notified command failed      |
 | `confirm_close`          | `busy`         | `busy` \| `always` \| `never`               |
 | `count_as_busy`          | `["foreground", "suspended"]` | what closing asks about      |
 

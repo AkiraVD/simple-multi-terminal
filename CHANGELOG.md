@@ -25,6 +25,39 @@ Nothing has been tagged yet, so everything below is unreleased. Newest first.
 
 ### Added
 
+- **A tab's dot says what the tab is doing: yellow working, green finished,
+  red failed.** Replaces the single attention colour, and covers what used to
+  be unsaid — that something is running at all. Working outranks finished and
+  a failure outranks both, so one dot per tab is enough. The shell raises it at `preexec` and drops it at the
+  next prompt using an `OSC 6` escape — one `printf`, measured 12 µs per
+  command, against ~246 µs for the fork a helper process would cost, so it can
+  afford to fire on every command where `smt-notify` could not. Claude Code's
+  `UserPromptSubmit` hook raises it inside a claude session, where the shell
+  sees only one long-running command, and `Stop` or a permission prompt drops
+  it — so the tab is yellow exactly while Claude is writing. The tooltip names
+  the program when its name travels safely in a URI, and in a split tab the dot
+  speaks for whichever pane has the most to say.
+
+  The shell only marks a command once it has reached its first prompt, and the
+  marker is cleared by the *last* entry in `PROMPT_COMMAND` rather than by
+  ours. Both matter, and both were found by capturing what a real bash emits on
+  a pty: the `DEBUG` trap fires for the rc file's own commands, which left
+  every tab yellow from launch until its first prompt, and it fires again for
+  any other `PROMPT_COMMAND` entry — `history -a`, direnv, atuin — which landed
+  a busy mark *after* our clear and left the tab yellow the whole time it sat
+  at the prompt. An array-valued `PROMPT_COMMAND` is appended to rather than
+  overwritten, which also fixes a pre-existing clobber of element zero.
+
+  It is a dot rather than libadwaita's spinner because the spinner is animated:
+  measured ~5% of a core for one tab and 7–14% for four, for as long as they
+  turned, where the dot measures 0.0–0.2%, the same as an idle tab. Memory is
+  unchanged either way (57 MB with four tabs, inside the noise of the version
+  before it).
+
+  `attention_color` is replaced by `color_working`, `color_done` and
+  `color_error`; an old key left in config.json is ignored. New `show_activity`
+  preference turns the yellow dot off on its own. Existing installs want
+  `./install.sh` re-run for the hook, and a new shell for the rest.
 - **Find in the scrollback.** `Ctrl+Shift+F` (`Cmd+F` on macOS) opens a search
   bar for the focused pane; `Enter` walks back through older matches,
   `Shift+Enter` forward, `Escape` closes. Literal text, escaped, not a regex.

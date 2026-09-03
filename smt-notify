@@ -9,6 +9,7 @@ Claude Code hooks that may run anywhere.
   smt-notify command-done --exit 1 --seconds 42 --command "npm run build"
   smt-notify claude-waiting "Permission needed for Bash"
   smt-notify claude-done
+  smt-notify working
   smt-notify clear
 
 For the Claude kinds, if no message is given on the command line it will try
@@ -19,7 +20,7 @@ import os
 import socket
 import sys
 
-KINDS = ("command-done", "claude-waiting", "claude-done", "clear")
+KINDS = ("command-done", "claude-waiting", "claude-done", "working", "clear")
 
 
 def stdin_message():

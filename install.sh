@@ -119,7 +119,7 @@ except (OSError, ValueError):
 wanted = {
     "Notification":     "smt-notify claude-waiting",
     "Stop":             "smt-notify claude-done",
-    "UserPromptSubmit": "smt-notify clear",
+    "UserPromptSubmit": "smt-notify working",
 }
 hooks = settings.setdefault("hooks", {})
 changed = False

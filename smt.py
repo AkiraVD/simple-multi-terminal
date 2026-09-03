@@ -60,7 +60,11 @@ DEFAULT_CONFIG = {
     "shell": None,
     "login_shell": False,
     # Colour of the dot on tabs with a pending notification.
-    "attention_color": "#f6d32d",
+    # The dot a tab wears, by what it is saying. Yellow while something runs,
+    # green when it finished or wants you, red when it failed.
+    "color_working": "#f6d32d",
+    "color_done": "#2ec27e",
+    "color_error": "#e01b24",
     # When to ask before closing a tab: "busy", "always", or "never".
     "confirm_close": "busy",
     # What "busy" means. Any subset of:
@@ -70,6 +74,7 @@ DEFAULT_CONFIG = {
     # Background is off by default: you detached those on purpose, and a lot
     # of ordinary programs leave helper processes lying around.
     "count_as_busy": ["foreground", "suspended"],
+    "show_activity": True,
     "scroll_on_output": False,
     "scroll_on_keystroke": True,
 }
@@ -81,6 +86,13 @@ PALETTE = [
 ]
 FG, BG = "#d8d8d8", "#1b1d1e"
 
+
+# How the shell says "a command is running", and how it takes it back: OSC 6,
+# the current-file URI, which nothing else here uses and which VTE hands over
+# as a signal. The point is what it is not — the shell spends one printf per
+# command instead of a process, and nothing polls the process table to find
+# out whether a tab is busy.
+BUSY_URI = "file:///smt/busy"
 
 # PCRE2 compile flags, spelled out because VTE refuses a regex without
 # MULTILINE and the numbers are the only place they appear.
@@ -335,6 +347,8 @@ class Terminal(Vte.Terminal):
         self.osc_title = None
         self.cwd = cwd or os.path.expanduser("~")
         self.attention_reason = None
+        self.attention_failed = False   # the notification was a failure
+        self.working = None        # what this pane is busy with, or None
         self.child_pid = None
         self.force_close = False   # the shell already exited; nothing to confirm
 
@@ -348,6 +362,7 @@ class Terminal(Vte.Terminal):
         self.connect("bell", self._on_bell)
         self.connect("window-title-changed", self._on_osc_title)
         self.connect("current-directory-uri-changed", self._on_cwd_changed)
+        self.connect("current-file-uri-changed", self._on_activity)
         self.connect("setup-context-menu", self._on_context_menu)
 
         # Which pane has the keyboard decides which one its tab speaks for.
@@ -391,9 +406,9 @@ class Terminal(Vte.Terminal):
         self.set_scroll_on_output(bool(cfg["scroll_on_output"]))
         self.set_scroll_on_keystroke(bool(cfg["scroll_on_keystroke"]))
         self.apply_min_size()
-        # Recolouring the dot only shows up on tabs currently wearing one.
-        if self.attention_reason and self.page:
-            self.page.set_indicator_icon(self.app.attention_icon)
+        # Covers both a recoloured dot and the indicator being switched off,
+        # neither of which shows up until the tab is asked to draw it again.
+        self.refresh_indicator()
 
     def apply_min_size(self):
         """Stop this pane from being squeezed into nonsense.
@@ -452,6 +467,7 @@ class Terminal(Vte.Terminal):
             self.feed(f"\r\n\x1b[31mFailed to start shell: {error.message}\x1b[0m\r\n".encode())
 
     def _on_child_exited(self, _term, _status):
+        self.set_working(None)
         self.child_pid = None
         self.app.window.close_terminal(self)
 
@@ -617,8 +633,74 @@ class Terminal(Vte.Terminal):
         self.set_context_menu_model(menu)
         return False
 
+    # ---- activity -------------------------------------------------------
+    def _on_activity(self, _t):
+        """OSC 6 arrived: the shell marking a command started, or finished."""
+        uri = self.get_current_file_uri() or ""
+        if not uri.startswith(BUSY_URI):
+            self.set_working(None)
+            return
+        # Everything after the marker is the program's name, sent only when it
+        # is plain enough not to need encoding. Absent is normal, not an error.
+        self.set_working(uri[len(BUSY_URI):].strip("/") or "a command")
+
+    def set_working(self, what):
+        """Flag or clear "this pane is busy with something".
+
+        Sources disagree in useful ways and that is the point: the shell says a
+        command is running, and Claude Code's hooks say whether Claude inside
+        that command is thinking or waiting on you. A claude session is one
+        long shell command, so without the hooks the tab would sit yellow for
+        the whole session and tell you nothing.
+        """
+        if what == self.working:
+            return
+        self.working = what
+        self.refresh_indicator()
+
+    # ---- the dot --------------------------------------------------------
+    def refresh_indicator(self):
+        """Put one dot on the tab, saying whichever thing matters most.
+
+        Working outranks a finished notification deliberately: once a pane has
+        started something new, how the last command ended is history. Red
+        outranks green for the opposite reason — a failure you have not looked
+        at is worth more of your attention than a success.
+
+        A dot rather than libadwaita's spinner because the spinner is animated:
+        measured ~5% of a core for as long as it turns, which a half-hour build
+        would pay in full. The dot costs nothing to keep on screen.
+        """
+        if not self.page:
+            return
+        panes = pane_terminals(self.page)
+        working = [t.working for t in panes if t.working]
+        if not self.app.config["show_activity"]:
+            working = []
+        failed = [t.attention_reason for t in panes
+                  if t.attention_reason and t.attention_failed]
+        done = [t.attention_reason for t in panes if t.attention_reason]
+
+        if working:
+            state, label = "working", f"Working: {working[0]}"
+        elif failed:
+            state, label = "error", failed[0]
+        elif done:
+            state, label = "done", done[0]
+        else:
+            state, label = None, ""
+
+        self.page.set_indicator_icon(self.app.dot_icons[state] if state else None)
+        self.page.set_indicator_tooltip(label)
+        # The glow is for wanting you, which working does not: a tab quietly
+        # getting on with something should not pull at the eye.
+        self.page.set_needs_attention(bool(failed or done))
+        # What the tab ended up showing, which is otherwise only knowable by
+        # comparing GIcons.
+        self.page.smt_indicator = state
+
     # ---- attention ------------------------------------------------------
-    def set_attention(self, on, reason=None):
+    def set_attention(self, on, reason=None, failed=False):
         """Flag or clear this tab's pending notification.
 
         Two indicators, because they are visible in different situations:
@@ -628,11 +710,10 @@ class Terminal(Vte.Terminal):
         """
         pending = self.attention_reason is not None
         self.attention_reason = reason if on else None
+        self.attention_failed = failed if on else False
         if not self.page:
             return
-        self.page.set_needs_attention(on)
-        self.page.set_indicator_icon(self.app.attention_icon if on else None)
-        self.page.set_indicator_tooltip(reason or "")
+        self.refresh_indicator()
         if pending and not on:
             # Drop the desktop notification still sitting in the shell's tray;
             # you have looked at the tab, so it has done its job.
@@ -1548,7 +1629,20 @@ class Preferences(Adw.PreferencesDialog):
                    "Seconds a command must run before finishing is worth a notification")
         self._switch(notify, "notify_on_bell", "Terminal bell")
         self._switch(notify, "audible_bell", "Play the bell sound")
-        notify.add(self._color_row())
+        dots = Adw.PreferencesGroup(
+            title="Tab dots",
+            description="One dot per tab, saying whichever thing matters most: "
+                        "working outranks finished, and a failure outranks both.",
+        )
+        page.add(dots)
+        dots.add(self._color_row("color_working", "Working",
+                                 "A command is running, or Claude is answering"))
+        dots.add(self._color_row("color_done", "Finished",
+                                 "Done, or waiting for you"))
+        dots.add(self._color_row("color_error", "Failed",
+                                 "A command that notified exited non-zero"))
+        self._switch(dots, "show_activity", "Show the working dot",
+                     "Off leaves only the finished and failed dots")
 
         closing = Adw.PreferencesGroup(title="Closing a tab")
         page.add(closing)
@@ -1644,18 +1738,17 @@ class Preferences(Adw.PreferencesDialog):
         self.rows["font"] = row
         return row
 
-    def _color_row(self):
+    def _color_row(self, key, title, subtitle):
         button = Gtk.ColorDialogButton(
             dialog=Gtk.ColorDialog(with_alpha=False), valign=Gtk.Align.CENTER,
-            rgba=rgba(self.app.config["attention_color"]),
+            rgba=rgba(self.app.config[key]),
         )
         button.connect("notify::rgba", lambda b, _p: self.app.set_config(
-            "attention_color", hexcolor(b.get_rgba())))
-        row = Adw.ActionRow(title="Attention dot",
-                            subtitle="Marks tabs with a pending notification")
+            key, hexcolor(b.get_rgba())))
+        row = Adw.ActionRow(title=title, subtitle=subtitle)
         row.add_suffix(button)
         row.set_activatable_widget(button)
-        self.rows["attention_color"] = row
+        self.rows[key] = row
         return row
 
     def _shell_row(self):
@@ -1778,7 +1871,7 @@ class App(Adw.Application):
     def __init__(self):
         super().__init__(application_id=APP_ID, flags=Gio.ApplicationFlags.HANDLES_COMMAND_LINE)
         self.config = {**DEFAULT_CONFIG, **load_json(CONFIG_PATH, {})}
-        self.attention_icon = dot_icon(self.config["attention_color"])
+        self.dot_icons = self._dot_icons()
         self.window = None
         # macOS needs one fixed path, because that is how a second launch
         # finds the first without a D-Bus bus to ask. Linux keeps one socket
@@ -1794,6 +1887,11 @@ class App(Adw.Application):
             "working-directory", ord("d"), GLib.OptionFlags.NONE,
             GLib.OptionArg.FILENAME, "Open the first tab here", "DIR",
         )
+
+    def _dot_icons(self):
+        """One dot per state, rebuilt whenever a colour preference changes."""
+        return {state: dot_icon(self.config[f"color_{state}"])
+                for state in ("working", "done", "error")}
 
     # ---- lifecycle -------------------------------------------------------
     def do_command_line(self, command_line):
@@ -1880,8 +1978,8 @@ class App(Adw.Application):
             return
         self.config[key] = value
         debug("config", key, "=", value)
-        if key == "attention_color":
-            self.attention_icon = dot_icon(value)
+        if key.startswith("color_"):
+            self.dot_icons = self._dot_icons()
         if self.window:
             for term in self.window.terminals():
                 term.apply_config()
@@ -2049,28 +2147,44 @@ class App(Adw.Application):
             debug("no terminal for tab_id", msg.get("tab_id"))
             return None
 
-        if kind == "command-done":
+        if kind == "working":
+            # Claude Code's UserPromptSubmit hook: the answer is being written
+            # now. The shell cannot see this — from out there, claude is one
+            # command that has been running since you started it.
+            term.set_working(msg.get("message") or "Claude")
+            term.set_attention(False)
+
+        elif kind == "command-done":
             if not self.config["notify_on_command_done"]:
                 return
             secs = float(msg.get("seconds", 0))
             code = int(msg.get("exit_code", 0))
             cmd = (msg.get("command") or "").strip()[:60]
             mark = "✓" if code == 0 else f"✗ exit {code}"
-            self.notify_tab(term, f"{mark}  {cmd or 'command'}", f"finished in {secs:.0f}s")
+            term.set_working(None)
+            self.notify_tab(term, f"{mark}  {cmd or 'command'}",
+                            f"finished in {secs:.0f}s", failed=code != 0)
 
         elif kind == "claude-waiting":
+            # Waiting on you is not working, whatever the shell still thinks.
+            term.set_working(None)
             if self.config["notify_on_claude"]:
                 body = msg.get("message") or "Claude is waiting for you"
                 self.notify_tab(term, "Claude needs input", body)
 
         elif kind == "claude-done":
+            term.set_working(None)
             if self.config["notify_on_claude"]:
                 self.notify_tab(term, "Claude finished", msg.get("message") or "Response complete")
 
         elif kind == "clear":
+            # Deliberately does not touch the working state. Older installs
+            # have "smt-notify clear" on UserPromptSubmit and new ones have
+            # "smt-notify working"; both fire, in no guaranteed order, and a
+            # clear that also stopped the spinner could land last and undo it.
             term.set_attention(False)
 
-    def notify_tab(self, term, title, body):
+    def notify_tab(self, term, title, body, failed=False):
         """Badge the tab, and raise a desktop notification if it isn't visible."""
         focused = (
             self.window
@@ -2080,7 +2194,7 @@ class App(Adw.Application):
         debug("notify", title, "|", body, "focused=", focused)
         if focused:
             return
-        term.set_attention(True, f"{title} — {body}")
+        term.set_attention(True, f"{title} — {body}", failed=failed)
 
         self.desktop_notify(f"smt-{term.tab_id}", title,
                             f"{term.display_title()} — {body}")
