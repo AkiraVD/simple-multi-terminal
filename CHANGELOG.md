@@ -25,6 +25,32 @@ Nothing has been tagged yet, so everything below is unreleased. Newest first.
 
 ### Added
 
+- **Find in the scrollback.** `Ctrl+Shift+F` (`Cmd+F` on macOS) opens a search
+  bar for the focused pane; `Enter` walks back through older matches,
+  `Shift+Enter` forward, `Escape` closes. Literal text, escaped, not a regex.
+  The bar is built on first use rather than at startup, and closing it clears
+  the regex from every terminal in the window, so a session that never searches
+  pays nothing: measured 0.00 MB until the key is pressed, then ~1.5 MB the
+  first time — of which only ~0.2 MB is the search itself, the rest being GTK's
+  text-input machinery, which the tab-rename dialog also pays for whichever of
+  the two you open first. Searching 1,200 lines 20 times measured +0.02 MB.
+  Because VTE keeps the search regex per terminal and this window has several,
+  the regex is swept off all of them and set on the focused one at each step.
+- **Links are clickable, without costing anything when they are not.**
+  `Ctrl+click` (`Cmd+click` on macOS) opens the URL under the pointer, and
+  right-clicking one offers *Open Link* and *Copy Link Address*. The URL regex
+  is added for the length of a single lookup and removed again, rather than
+  being attached to every terminal for the life of the process the way
+  `match_add_regex` is normally used: idle mouse-motion cost measured 1.24 µs
+  per event against 1.29 µs before the feature, i.e. unchanged. The trade is
+  that links do not underline on hover, since nothing is watching. Only
+  `http`, `https`, `ftp` and `file` URLs are opened, and never through a shell.
+- **A keyboard shortcut list inside the app.** `Ctrl+?` or `F1` (`Cmd+?` or
+  `Cmd+/` on macOS), the keyboard button in the header bar, or *Keyboard
+  Shortcuts* in a terminal's right-click menu. The rows are built by asking the
+  application which accelerators each action ended up with, so the list cannot
+  drift from the bindings, and on macOS it shows the Command set without a
+  second table to keep in step.
 - **macOS support, and a standalone app bundle.** Re-applies the work that was
   merged in #4 and reverted in #5, unchanged apart from being rebased past the
   split-pane and prompt-garbling fixes. Every platform-specific path sits

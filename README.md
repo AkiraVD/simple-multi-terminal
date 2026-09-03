@@ -87,14 +87,46 @@ On Linux the desktop entry does the same job, and `make-app.sh` is not used.
 | `Ctrl+Shift+W`        | `Cmd+W`               | close tab (asks if busy) |
 | `Ctrl+Shift+R` / `F2` | `Cmd+Shift+R`         | rename tab          |
 | `Ctrl+Shift+C` / `V`  | `Cmd+C` / `Cmd+V`     | copy / paste        |
+| `Ctrl+Shift+F`        | `Cmd+F`               | find in the scrollback |
 | `Ctrl+PageUp/Down`    | `Cmd+Shift+[` / `]`   | previous / next tab |
 | `Alt+1`…`Alt+9`       | `Cmd+1`…`Cmd+9`       | jump to tab         |
 | `Ctrl+±` / `Ctrl+0`   | `Cmd+±` / `Cmd+0`     | font size           |
 | `Ctrl+,`              | `Cmd+,`               | preferences         |
+| `Ctrl+?` / `F1`       | `Cmd+?` / `Cmd+/`     | this list, in the app |
+| `Ctrl+click` a link   | `Cmd+click`           | open it in your browser |
 | `Ctrl+Shift+D`        | `Cmd+D`               | split right         |
 | `Ctrl+Shift+E`        | `Cmd+Shift+D`         | split down          |
 | `Ctrl+Shift+X`        | `Cmd+Shift+W`         | close pane          |
 | `Alt+←↑↓→`            | `Cmd+Option+←↑↓→`     | move between panes  |
+
+`Ctrl+Shift+F` searches the scrollback of the pane you are in. `Enter` walks
+backwards through older matches and `Shift+Enter` forwards, because the
+viewport sits at the newest output when the bar opens and searching forwards
+from there would wrap straight to the oldest match in the buffer. `Escape`
+closes the bar and hands the keyboard back to the terminal. The search is
+literal, not a regex — the text you type is escaped.
+
+The bar is built the first time you press the key, and the regex is taken back
+off every terminal when you close it, so a session that never searches carries
+none of it. Opening it for the first time costs ~1.5 MB, almost all of which is
+GTK's text-input machinery: the same cost the rename dialog pays, so whichever
+you use first pays it and the other is then ~0.2 MB.
+
+Right-clicking a link offers *Open Link* and *Copy Link Address*, and the two
+appear only when the click actually landed on one. Links are matched at the
+moment you click and forgotten immediately: a match regex left attached makes
+VTE test every mouse-motion event over every pane for as long as the process
+lives, which is a standing cost for a feature used a few times a day. Nothing
+underlines on hover, and that is the trade — hovering costs the same as it did
+before links existed (measured: 1.24 vs 1.29 µs per motion event). Only
+`http`, `https`, `ftp` and `file` are opened, since an OSC 8 hyperlink carries
+whatever scheme the program that printed it chose, and the URL is passed as
+one argv entry, never through a shell.
+
+The keyboard button in the header bar opens the same list, and so does
+*Keyboard Shortcuts* in a terminal's right-click menu. It is generated from the
+bindings the window actually installs, so it shows the platform's own set
+rather than a copy of this table.
 
 On macOS both sets are live. The Command bindings exist because `Alt+digit`
 types an accented character on a Mac keyboard, and because `Cmd` collides with
