@@ -15,7 +15,7 @@ import gi
 gi.require_version("Gtk", "4.0")
 gi.require_version("Adw", "1")
 gi.require_version("Vte", "3.91")
-from gi.repository import Adw, Gdk, Gio, GLib, Gtk, Pango, Vte  # noqa: E402
+from gi.repository import Adw, Gdk, Gio, GLib, GObject, Gtk, Pango, Vte  # noqa: E402
 
 import json  # noqa: E402
 import shutil  # noqa: E402
@@ -80,6 +80,63 @@ PALETTE = [
     "#7f8c8d", "#c0392b", "#1cdc9a", "#fdbc4b", "#3daee9", "#8e44ad", "#16a085", "#ffffff",
 ]
 FG, BG = "#d8d8d8", "#1b1d1e"
+
+
+# PCRE2 compile flags, spelled out because VTE refuses a regex without
+# MULTILINE and the numbers are the only place they appear.
+PCRE2_MULTILINE = 0x00000400
+PCRE2_UTF = 0x00080000
+PCRE2_JIT_COMPLETE = 0x0001
+PCRE2_JIT_PARTIAL_SOFT = 0x0002
+
+# Schemes and hosts only, no cleverness: a tight pattern costs ~0.09us to test
+# and a loose one measured 34-48us, which is the whole difference between a
+# link that is free and a link you feel while dragging the mouse.
+URL_PATTERN = (
+    r"(?i:https?|ftp|file)://[[:alnum:]]+(?:[-.:@][[:alnum:]]+)*"
+    r"(?:/[^[:space:]<>\"'`]*)?"
+)
+# Schemes worth handing to the desktop. An OSC 8 hyperlink carries whatever
+# scheme the program printing it chose, and the screen is not a trustworthy
+# source, so opening is limited to the four that only ever mean "show this".
+OPENABLE_SCHEMES = ("http://", "https://", "ftp://", "file://")
+
+_url_regex = None
+
+
+def url_regex():
+    """The URL pattern, compiled on the first click that asks for one.
+
+    Compiling at import would cost every session a regex most of them never
+    use. None means the compile failed, and the callers treat that as "no
+    link here" rather than breaking a right-click.
+    """
+    global _url_regex
+    if _url_regex is None:
+        try:
+            _url_regex = Vte.Regex.new_for_match(
+                URL_PATTERN, -1, PCRE2_MULTILINE | PCRE2_UTF)
+            _url_regex.jit(PCRE2_JIT_COMPLETE)
+            _url_regex.jit(PCRE2_JIT_PARTIAL_SOFT)
+        except GLib.Error as exc:
+            debug("URL matching unavailable:", exc)
+            _url_regex = False
+    return _url_regex or None
+
+
+def open_uri(uri, parent=None):
+    """Hand a URL to the desktop, if it is one of the schemes we open.
+
+    Never through a shell: the string was scraped off a terminal screen, and
+    an argv list keeps it one argument whatever it contains.
+    """
+    if not uri.lower().startswith(OPENABLE_SCHEMES):
+        debug("refusing to open", uri)
+        return
+    if IS_MAC:
+        _spawn_detached(["open", uri])
+        return
+    Gtk.UriLauncher.new(uri).launch(parent, None, None)
 
 
 # ---- platform ------------------------------------------------------------
@@ -307,6 +364,15 @@ class Terminal(Vte.Terminal):
             keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
             keys.connect("key-pressed", self._on_mac_editing_key)
             self.add_controller(keys)
+
+        # Capture phase for the same reason: VTE claims button presses for its
+        # own selection handling. The gesture only takes the press when the
+        # modifier is down *and* there is a link under it, so an ordinary
+        # click, and a modified click over plain text, still belong to VTE.
+        clicks = Gtk.GestureClick(button=Gdk.BUTTON_PRIMARY)
+        clicks.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        clicks.connect("pressed", self._on_click)
+        self.add_controller(clicks)
         self._spawn()
 
     # ---- settings --------------------------------------------------------
@@ -476,8 +542,67 @@ class Terminal(Vte.Terminal):
             self.refresh_title()
             self.app.schedule_session_save()
 
-    def _on_context_menu(self, _t, _ctx):
+    # ---- links ----------------------------------------------------------
+    def link_at(self, x, y):
+        """The URL under a point, or None. Matched on demand, then forgotten.
+
+        An OSC 8 hyperlink is tracked already (set_allow_hyperlink), so asking
+        about one is free. Plain text needs a regex, and a regex left attached
+        is the cost this terminal will not pay: VTE would test it against every
+        mouse-motion event, over every pane, for the life of the process,
+        whether or not anyone ever clicks a link. Adding it for the length of
+        one lookup keeps the idle cost at zero and bills the click that asked.
+        """
+        uri = self.check_hyperlink_at(x, y)
+        if uri:
+            return uri
+        regex = url_regex()
+        if regex is None:
+            return None
+        self.match_add_regex(regex, 0)
+        try:
+            match = self.check_match_at(x, y)
+        finally:
+            # Unconditional: a lookup that raises must not leave the pane
+            # paying for a regex nobody asked to keep.
+            self.match_remove_all()
+        uri = match[0] if isinstance(match, tuple) else match
+        return uri or None
+
+    def _on_click(self, gesture, _n_press, x, y):
+        # Ctrl+click on a Mac is the contextual-menu gesture, so there the
+        # opener lives on Cmd, which is where the rest of the Mac bindings are.
+        held = (Gdk.ModifierType.META_MASK if IS_MAC
+                else Gdk.ModifierType.CONTROL_MASK)
+        if not gesture.get_current_event_state() & held:
+            return
+        uri = self.link_at(x, y)
+        if not uri:
+            return
+        gesture.set_state(Gtk.EventSequenceState.CLAIMED)
+        open_uri(uri, self.get_root())
+
+    def _on_context_menu(self, _t, ctx):
         menu = Gio.Menu()
+        # The menu is built per click, so the link items exist only when the
+        # click landed on one. A menu opened from the keyboard has no event
+        # context and so no coordinates: there is nothing under a pointer that
+        # was never there.
+        uri = None
+        if ctx is not None:
+            found, x, y = ctx.get_coordinates()
+            if found:
+                uri = self.link_at(x, y)
+        if uri:
+            links = Gio.Menu()
+            for label, action in (("Open Link", "win.open-uri"),
+                                  ("Copy Link Address", "win.copy-uri")):
+                item = Gio.MenuItem.new(label, None)
+                # set_action_and_target_value rather than an action string:
+                # a URL off the screen has no business being parsed as one.
+                item.set_action_and_target_value(action, GLib.Variant("s", uri))
+                links.append_item(item)
+            menu.append_section(None, links)
         menu.append("Copy", "win.copy")
         menu.append("Paste", "win.paste")
         splits = Gio.Menu()
@@ -487,6 +612,7 @@ class Terminal(Vte.Terminal):
         section = Gio.Menu()
         section.append("Rename Tab…", "win.rename-tab")
         section.append("New Tab", "win.new-tab")
+        section.append("Keyboard Shortcuts", "win.shortcuts")
         menu.append_section(None, section)
         self.set_context_menu_model(menu)
         return False
@@ -643,6 +769,21 @@ def focus_soon(term):
     GLib.timeout_add(30, go)
 
 
+def keyboard_icon():
+    """Icon for the shortcuts button, first one the theme actually has.
+
+    The shortcuts icon lives in Adwaita's `legacy/` set, which a trimmed theme
+    — or the icon theme Homebrew installs on macOS — may not carry, and a
+    missing icon draws as the broken-image square rather than as nothing.
+    """
+    theme = Gtk.IconTheme.get_for_display(Gdk.Display.get_default())
+    for name in ("preferences-desktop-keyboard-shortcuts-symbolic",
+                 "input-keyboard-symbolic"):
+        if theme.has_icon(name):
+            return name
+    return "help-about-symbolic"
+
+
 # Command-key equivalents, added alongside the Ctrl bindings on macOS. GDK maps
 # the Mac Command key to <Meta>, and unlike Ctrl it collides with nothing the
 # shell wants: Ctrl+C in a tab has to stay Ctrl+C.
@@ -651,6 +792,8 @@ MAC_ACCELS = {
     "close-tab":   ["<Meta>w"],
     "rename-tab":  ["<Meta><Shift>r"],
     "preferences": ["<Meta>comma"],
+    "shortcuts":   ["<Meta>question", "<Meta>slash"],
+    "search":      ["<Meta>f"],
     "copy":        ["<Meta>c"],
     "paste":       ["<Meta>v"],
     "next-tab":    ["<Meta><Shift>bracketright"],
@@ -693,9 +836,14 @@ class Window(Adw.ApplicationWindow):
             icon_name="emblem-system-symbolic",
             tooltip_text=f"Preferences ({'Cmd+,' if IS_MAC else 'Ctrl+,'})")
         prefs_btn.set_action_name("win.preferences")
+        keys_btn = Gtk.Button(
+            icon_name=keyboard_icon(),
+            tooltip_text=f"Keyboard Shortcuts ({'Cmd+?' if IS_MAC else 'Ctrl+?'})")
+        keys_btn.set_action_name("win.shortcuts")
         header = Adw.HeaderBar()
         header.pack_start(new_btn)
         header.pack_end(prefs_btn)
+        header.pack_end(keys_btn)
         tabbar.set_start_action_widget(Gtk.Box())
 
         toolbar = Adw.ToolbarView()
@@ -703,6 +851,15 @@ class Window(Adw.ApplicationWindow):
         toolbar.add_top_bar(tabbar)
         toolbar.set_content(self.tabview)
         self.set_content(toolbar)
+        self.toolbar = toolbar
+
+        # The search bar is built on the first Ctrl+Shift+F, not here: until
+        # someone searches, the feature is one action and one accelerator, and
+        # no terminal is carrying a search regex.
+        self._search_bar = None
+        self._search_entry = None
+        self._search_regex = None       # compiled once per search text
+        self._search_text = ""
 
         self.connect("notify::is-active", self._on_active_changed)
         self.connect("close-request", self._on_close_request)
@@ -715,6 +872,8 @@ class Window(Adw.ApplicationWindow):
             ("close-tab",   self.action_close_tab,   ["<Control><Shift>w"]),
             ("rename-tab",  self.action_rename_tab,  ["<Control><Shift>r", "F2"]),
             ("preferences",  self.action_preferences, ["<Control>comma"]),
+            ("shortcuts",   self.action_shortcuts,   ["<Control>question", "F1"]),
+            ("search",      self.action_search,      ["<Control><Shift>f"]),
             ("copy",        self.action_copy,        ["<Control><Shift>c"]),
             ("paste",       self.action_paste,       ["<Control><Shift>v"]),
             ("next-tab",    self.action_next_tab,    ["<Control>Page_Down", "<Control><Shift>Right"]),
@@ -744,6 +903,15 @@ class Window(Adw.ApplicationWindow):
             self.add_action(act)
             self.app.set_accels_for_action(f"win.{name}", accels)
 
+        # The two link actions take the URL as their target, so they need no
+        # state of their own and no accelerator: they exist only to be pointed
+        # at by a menu item the context menu built for one particular click.
+        for name, cb in (("open-uri", self.action_open_uri),
+                         ("copy-uri", self.action_copy_uri)):
+            act = Gio.SimpleAction.new(name, GLib.VariantType.new("s"))
+            act.connect("activate", cb)
+            self.add_action(act)
+
         # Alt+1..9 jumps to a tab.
         goto = Gio.SimpleAction.new("goto-tab", GLib.VariantType.new("i"))
         goto.connect("activate", self.action_goto_tab)
@@ -761,6 +929,129 @@ class Window(Adw.ApplicationWindow):
     def action_preferences(self, *_):
         Preferences(self.app).present(self)
 
+    def action_shortcuts(self, *_):
+        Shortcuts(self.app).present(self)
+
+    # ---- search ----------------------------------------------------------
+    def action_search(self, *_):
+        bar = self._search_bar or self._build_search_bar()
+        bar.set_search_mode(True)
+        self._search_entry.grab_focus()
+        self._search_entry.select_region(0, -1)
+
+    def _build_search_bar(self):
+        """The search UI, made the first time it is asked for.
+
+        Building it in __init__ would cost every session a widget tree most of
+        them never open — the same bargain link matching makes, where the click
+        that wants the feature is the one that pays for it.
+        """
+        entry = Gtk.SearchEntry(hexpand=True,
+                                placeholder_text="Find in the scrollback")
+        entry.connect("search-changed", self._on_search_changed)
+        entry.connect("stop-search", lambda _e: self._search_close())
+        # Capture phase, so Enter reaches this before the entry turns it into
+        # ::activate and the step happens twice.
+        keys = Gtk.EventControllerKey()
+        keys.set_propagation_phase(Gtk.PropagationPhase.CAPTURE)
+        keys.connect("key-pressed", self._on_search_key)
+        entry.add_controller(keys)
+
+        box = Gtk.Box(spacing=6)
+        box.append(entry)
+        for icon, tip, back in (
+                ("go-up-symbolic", "Older match (Enter)", True),
+                ("go-down-symbolic", "Newer match (Shift+Enter)", False)):
+            button = Gtk.Button(icon_name=icon, tooltip_text=tip)
+            button.connect("clicked", lambda _b, back=back: self._search_step(back))
+            box.append(button)
+
+        bar = Gtk.SearchBar(child=box, show_close_button=True)
+        bar.connect("notify::search-mode-enabled", self._on_search_mode)
+        self.toolbar.add_top_bar(bar)
+        self._search_bar, self._search_entry = bar, entry
+        return bar
+
+    def _on_search_key(self, _controller, keyval, _keycode, state):
+        if keyval == Gdk.KEY_Escape:
+            self._search_close()
+            return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter, Gdk.KEY_ISO_Enter):
+            # Enter goes backwards. The viewport sits at the newest output when
+            # the bar opens, so "forward" would wrap to the oldest match in the
+            # scrollback, which is never the one you are looking for.
+            self._search_step(not state & Gdk.ModifierType.SHIFT_MASK)
+            return True
+        return False
+
+    def _on_search_changed(self, entry):
+        entry.remove_css_class("error")
+        self._search_retarget()
+
+    def _search_clear(self):
+        """Leave no terminal in the window holding a search regex.
+
+        Sweeping them all rather than remembering which one had it: a terminal
+        dies down two different paths — a pane closing and a tab closing — and
+        a remembered one would outlive the widget. A window has a handful of
+        terminals and this only runs on a keystroke in the search entry.
+        """
+        for term in self.terminals():
+            term.search_set_regex(None, 0)
+
+    def _search_retarget(self):
+        """Point the focused terminal at what is in the entry, and leave no
+        other terminal carrying a regex nobody is searching with.
+
+        VTE holds the search regex per terminal and this window has several,
+        so switching tabs mid-search moves it rather than adding a second one.
+        """
+        term = self.current_terminal()
+        text = self._search_entry.get_text() if self._search_entry else ""
+        self._search_clear()
+        if term is None or not text:
+            return None
+        if text != self._search_text:
+            try:
+                # A literal search, escaped. Searching by regex is a different
+                # feature and nobody has asked for it.
+                self._search_regex = Vte.Regex.new_for_search(
+                    GLib.Regex.escape_string(text, -1), -1,
+                    PCRE2_MULTILINE | PCRE2_UTF)
+                self._search_text = text
+            except GLib.Error as exc:
+                debug("search regex rejected:", exc)
+                self._search_regex, self._search_text = None, ""
+                return None
+        term.search_set_regex(self._search_regex, 0)
+        term.search_set_wrap_around(True)
+        return term
+
+    def _search_step(self, backwards):
+        term = self._search_retarget()
+        if term is None:
+            return
+        found = (term.search_find_previous() if backwards
+                 else term.search_find_next())
+        if not found:
+            self._search_entry.add_css_class("error")
+
+    def _search_close(self):
+        if self._search_bar:
+            self._search_bar.set_search_mode(False)
+
+    def _on_search_mode(self, bar, _param):
+        if bar.get_search_mode():
+            return
+        # Closing takes the regex back off. A regex left set is the one part of
+        # search that would go on costing something with the bar shut.
+        self._search_clear()
+        if self._search_entry:
+            self._search_entry.remove_css_class("error")
+        term = self.current_terminal()
+        if term:
+            focus_soon(term)
+
     def action_close_tab(self, *_):
         page = self.tabview.get_selected_page()
         if page:
@@ -775,6 +1066,13 @@ class Window(Adw.ApplicationWindow):
         t = self.current_terminal()
         if t:
             t.paste_clipboard()
+
+    def action_open_uri(self, _a, param):
+        open_uri(param.get_string(), self)
+
+    def action_copy_uri(self, _a, param):
+        self.get_clipboard().set_content(
+            Gdk.ContentProvider.new_for_value(GObject.Value(str, param.get_string())))
 
     def action_next_tab(self, *_):
         self.tabview.select_next_page()
@@ -1366,6 +1664,113 @@ class Preferences(Adw.PreferencesDialog):
         row.connect("apply", lambda r: self.app.set_config(
             "shell", r.get_text().strip() or None))
         self.rows["shell"] = row
+        return row
+
+
+# What the shortcuts dialog lists, in the order it lists it. The keys
+# themselves are deliberately absent: every row asks the application for the
+# accelerators actually bound to the action, so the list cannot drift from
+# _install_actions, and on macOS it shows the Command bindings without a
+# second table to keep in step.
+SHORTCUT_SECTIONS = [
+    ("Tabs", [
+        ("new-tab",     "New tab", ""),
+        ("close-tab",   "Close tab", ""),
+        ("rename-tab",  "Rename tab", ""),
+        ("next-tab",    "Next tab", ""),
+        ("prev-tab",    "Previous tab", ""),
+        ("goto-tab(1)", "Jump to a tab by number",
+         "Up to nine tabs, in the order they sit in the bar"),
+    ]),
+    ("Panes", [
+        ("split-right", "Split right", ""),
+        ("split-down",  "Split down", ""),
+        ("close-pane",  "Close pane", ""),
+        ("focus-left",  "Focus the pane to the left", ""),
+        ("focus-right", "Focus the pane to the right", ""),
+        ("focus-up",    "Focus the pane above", ""),
+        ("focus-down",  "Focus the pane below", ""),
+    ]),
+    ("Search", [
+        ("search", "Find in the scrollback",
+         "Enter steps back through older matches, Shift+Enter forward"),
+    ]),
+    ("Clipboard", [
+        ("copy",  "Copy", ""),
+        ("paste", "Paste", ""),
+    ]),
+    ("View", [
+        ("zoom-in",    "Bigger font", ""),
+        ("zoom-out",   "Smaller font", ""),
+        ("zoom-reset", "Reset the font size", ""),
+    ]),
+    ("Application", [
+        ("preferences", "Preferences", ""),
+        ("shortcuts",   "This list", ""),
+    ]),
+]
+
+# Links are worked with the mouse, so these rows cannot come from the accel
+# table the way every other row does. They are written out, and being written
+# out is exactly why they get their own group rather than being smuggled in
+# among rows that are guaranteed to match what the window installed.
+LINK_GESTURES = [
+    ("Open the link under the pointer", "Cmd + click" if IS_MAC else "Ctrl + click"),
+    ("Open or copy a link", "Right-click it"),
+]
+
+
+class Shortcuts(Adw.Dialog):
+    """Every key the window binds, read back from the actions themselves."""
+
+    def __init__(self, app):
+        super().__init__(title="Keyboard Shortcuts",
+                         content_width=520, content_height=680)
+        page = Adw.PreferencesPage()
+        for title, entries in SHORTCUT_SECTIONS:
+            group = Adw.PreferencesGroup(title=title)
+            rows = 0
+            for name, description, subtitle in entries:
+                accels = app.get_accels_for_action(f"win.{name}")
+                if not accels:
+                    continue
+                group.add(self._row(description, subtitle, accels))
+                rows += 1
+            if rows:
+                page.add(group)
+
+        links = Adw.PreferencesGroup(
+            title="Links",
+            description="Recognised when you click, not while you hover: "
+                        "matching a link costs nothing until something asks.",
+        )
+        for description, gesture in LINK_GESTURES:
+            row = Adw.ActionRow(title=description)
+            row.add_suffix(Gtk.Label(label=gesture, css_classes=["dim-label"],
+                                     valign=Gtk.Align.CENTER))
+            links.add(row)
+        page.add(links)
+
+        toolbar = Adw.ToolbarView()
+        toolbar.add_top_bar(Adw.HeaderBar())
+        toolbar.set_content(page)
+        self.set_child(toolbar)
+
+    @staticmethod
+    def _row(description, subtitle, accels):
+        # A subtitle is for what the keycaps cannot show: the other eight
+        # digits of the tab jump, or which way Enter walks a search.
+        row = Adw.ActionRow(title=description, subtitle=subtitle)
+        keys = Gtk.Box(spacing=8, valign=Gtk.Align.CENTER)
+        # Two alternatives is the most any action has, and the most that fits
+        # beside a title without the row growing a second line. They need the
+        # "or" between them: two sets of keycaps side by side otherwise read as
+        # one long chord.
+        for i, accel in enumerate(accels[:2]):
+            if i:
+                keys.append(Gtk.Label(label="or", css_classes=["dim-label"]))
+            keys.append(Gtk.ShortcutLabel(accelerator=accel))
+        row.add_suffix(keys)
         return row
 
 
